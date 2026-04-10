@@ -52,9 +52,8 @@ const DEFAULT_WAIT_FOR_NODE_TAINTS_TIMEOUT_SECONDS = 300
 // is >= 256 MB, otherwise the `find` output accumulation will crash V8 with a
 // FATAL ERROR for large workspaces (e.g. pytorch/pytorch).
 const COPY_VERIFY_ENABLED =
-  (
-    process.env.ACTIONS_RUNNER_COPY_VERIFY_ENABLED || 'false'
-  ).toLowerCase() === 'true'
+  (process.env.ACTIONS_RUNNER_COPY_VERIFY_ENABLED || 'false').toLowerCase() ===
+  'true'
 const COPY_VERIFY_RETRIES = parseInt(
   process.env.ACTIONS_RUNNER_COPY_VERIFY_RETRIES || '3',
   10
@@ -404,6 +403,34 @@ export function extractExitCode(resp: k8s.V1Status): number | null {
   if (!cause?.message) return null
   const code = parseInt(cause.message, 10)
   return Number.isNaN(code) ? null : code
+}
+
+export async function execPodStepWithRetry(
+  command: string[],
+  podName: string,
+  containerName: string,
+  description: string,
+  maxAttempts = 7,
+  initialDelayMs = 1000
+): Promise<number> {
+  let lastError: Error | undefined
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await execPodStep(command, podName, containerName)
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+      if (attempt < maxAttempts) {
+        const delay = initialDelayMs * Math.pow(3, attempt - 1)
+        core.debug(
+          `execPodStepWithRetry(${description}): attempt ${attempt}/${maxAttempts} failed (${lastError.message}), retrying in ${delay}ms`
+        )
+        await sleep(delay)
+      }
+    }
+  }
+  throw new Error(
+    `execPodStepWithRetry(${description}) failed after ${maxAttempts} attempts: ${lastError?.message}`
+  )
 }
 
 export async function execPodStep(
@@ -1042,14 +1069,15 @@ export async function isPodContainerAlpine(
   containerName: string
 ): Promise<boolean> {
   try {
-    const exitCode = await execPodStep(
+    const exitCode = await execPodStepWithRetry(
       [
         'sh',
         '-c',
         `[ $(cat /etc/*release* | grep -i -e "^ID=*alpine*" -c) != 0 ] || exit 1`
       ],
       podName,
-      containerName
+      containerName,
+      'detect alpine'
     )
     return exitCode === 0
   } catch {

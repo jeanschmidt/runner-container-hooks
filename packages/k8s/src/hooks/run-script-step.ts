@@ -2,7 +2,12 @@
 import * as fs from 'fs'
 import * as core from '@actions/core'
 import { RunScriptStepArgs } from 'hooklib'
-import { execCpFromPod, execCpToPod, execPodStep } from '../k8s'
+import {
+  execCpFromPod,
+  execCpToPod,
+  execPodStep,
+  execPodStepWithRetry
+} from '../k8s'
 import { writeRunScript, sleep, listDirAllCommand } from '../k8s/utils'
 import { JOB_CONTAINER_NAME } from './constants'
 import { dirname } from 'path'
@@ -27,14 +32,15 @@ export async function runScriptStep(
   const containerTemp = '/__w/_temp'
   const containerTempSrc = '/__w/_temp_pre'
   // Ensure base and staging dirs exist before copying
-  const mkdirRc = await execPodStep(
+  const mkdirRc = await execPodStepWithRetry(
     [
       'sh',
       '-c',
       'mkdir -p /__w && mkdir -p /__w/_temp && mkdir -p /__w/_temp_pre'
     ],
     state.jobPod,
-    JOB_CONTAINER_NAME
+    JOB_CONTAINER_NAME,
+    'mkdir temp dirs'
   )
   if (mkdirRc !== 0) {
     throw new Error(
@@ -65,10 +71,11 @@ export async function runScriptStep(
   ]
 
   try {
-    const mergeRc = await execPodStep(
+    const mergeRc = await execPodStepWithRetry(
       ['sh', '-c', mergeCommands.join(' && ')],
       state.jobPod,
-      JOB_CONTAINER_NAME
+      JOB_CONTAINER_NAME,
+      'merge temp dirs'
     )
     if (mergeRc !== 0) {
       throw new Error(

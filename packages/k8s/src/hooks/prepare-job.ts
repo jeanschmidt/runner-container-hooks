@@ -15,7 +15,7 @@ import {
   waitForPodPhases,
   getPrepareJobTimeoutSeconds,
   execCpToPod,
-  execPodStep,
+  execPodStepWithRetry,
   waitForNodeTaintsRemoval
 } from '../k8s'
 import {
@@ -121,15 +121,14 @@ export async function prepareJob(
   await execCpToPod(createdPod.metadata.name, runnerWorkspace, '/__w')
 
   if (prepareScript) {
-    const prepareRc = await execPodStep(
+    const prepareRc = await execPodStepWithRetry(
       ['sh', '-e', prepareScript.containerPath],
       createdPod.metadata.name,
-      JOB_CONTAINER_NAME
+      JOB_CONTAINER_NAME,
+      'prepare-job script'
     )
     if (prepareRc !== 0) {
-      throw new Error(
-        `prepare-job script failed with exit code ${prepareRc}`
-      )
+      throw new Error(`prepare-job script failed with exit code ${prepareRc}`)
     }
 
     const promises: Promise<void>[] = []
