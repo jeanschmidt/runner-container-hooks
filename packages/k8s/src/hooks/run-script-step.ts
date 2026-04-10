@@ -8,9 +8,16 @@ import { writeRunScript } from '../k8s/utils'
 import { JOB_CONTAINER_NAME } from './constants'
 import { dirname } from 'path'
 
+export interface RunScriptStepState {
+  jobPod: string
+  rpcPodIp: string
+  rpcPort: number
+  rpcToken: string
+}
+
 export async function runScriptStep(
   args: RunScriptStepArgs,
-  state
+  state: RunScriptStepState
 ): Promise<number> {
   // Write the entrypoint first. This will be later coppied to the workflow pod
   const { entryPoint, entryPointArgs, environmentVariables } = args

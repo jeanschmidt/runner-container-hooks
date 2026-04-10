@@ -4,10 +4,16 @@ import { sleep } from './utils'
 import { execPodStepWithRetry, getPodByName } from './index'
 import { RPC_SERVER_SCRIPT } from './rpc-server-script'
 
-const RPC_PORT = 8080
+interface RpcStatusResponse {
+  id: string
+  status: 'idle' | 'running' | 'completed' | 'failed'
+  exit_code: number | null
+}
+
 const HEALTH_POLL_INTERVAL_MS = 1000
 const HEALTH_TIMEOUT_MS = 30000
-const HEARTBEAT_INTERVAL_MS = 1000
+const HEARTBEAT_INTERVAL_MS = 3000
+const MAX_PORT_ATTEMPTS = 3
 const HEARTBEAT_GRACE_MS = 60000
 const LOG_POLL_INTERVAL_MS = 200
 const FETCH_TIMEOUT_MS = 10000
@@ -27,19 +33,19 @@ async function healthCheck(podIp: string, port: number): Promise<boolean> {
   }
 }
 
+function randomPort(): number {
+  return Math.floor(Math.random() * 50000) + 10000
+}
+
 export async function deployRpcServer(
   podName: string,
-  containerName: string
+  containerName: string,
+  token: string
 ): Promise<{ podIp: string; port: number }> {
   const pod = await getPodByName(podName)
   const podIp = pod.status?.podIP
   if (!podIp) {
     throw new Error(`Pod ${podName} has no IP address`)
-  }
-
-  if (await healthCheck(podIp, RPC_PORT)) {
-    core.debug('RPC server already running, skipping deploy')
-    return { podIp, port: RPC_PORT }
   }
 
   try {
@@ -65,28 +71,45 @@ export async function deployRpcServer(
     'write rpc server'
   )
 
-  await execPodStepWithRetry(
-    [
-      'sh',
-      '-c',
-      `nohup python3 /tmp/rpc-server.py --port ${RPC_PORT} > /tmp/rpc-server.log 2>&1 & echo $!`
-    ],
-    podName,
-    containerName,
-    'start rpc server'
-  )
+  for (let attempt = 1; attempt <= MAX_PORT_ATTEMPTS; attempt++) {
+    const port = randomPort()
+    core.debug(
+      `Starting RPC server on port ${port} (attempt ${attempt}/${MAX_PORT_ATTEMPTS})`
+    )
 
-  const startTime = Date.now()
-  while (Date.now() - startTime < HEALTH_TIMEOUT_MS) {
-    if (await healthCheck(podIp, RPC_PORT)) {
-      core.debug(`RPC server healthy after ${Date.now() - startTime}ms`)
-      return { podIp, port: RPC_PORT }
+    await execPodStepWithRetry(
+      [
+        'sh',
+        '-c',
+        `nohup python3 /tmp/rpc-server.py --port ${port} --token ${token} > /tmp/rpc-server.log 2>&1 & echo $!`
+      ],
+      podName,
+      containerName,
+      'start rpc server'
+    )
+
+    const startTime = Date.now()
+    let healthy = false
+    while (Date.now() - startTime < HEALTH_TIMEOUT_MS) {
+      if (await healthCheck(podIp, port)) {
+        core.debug(`RPC server healthy after ${Date.now() - startTime}ms`)
+        healthy = true
+        break
+      }
+      await sleep(HEALTH_POLL_INTERVAL_MS)
     }
-    await sleep(HEALTH_POLL_INTERVAL_MS)
+
+    if (healthy) {
+      return { podIp, port }
+    }
+
+    core.debug(
+      `RPC server failed health check on port ${port}, attempt ${attempt}/${MAX_PORT_ATTEMPTS}`
+    )
   }
 
   throw new Error(
-    `RPC server failed to become healthy after ${HEALTH_TIMEOUT_MS}ms`
+    `RPC server failed to become healthy after ${MAX_PORT_ATTEMPTS} port attempts`
   )
 }
 
@@ -99,15 +122,52 @@ export async function rpcPodStep(
   const id = crypto.randomUUID()
   const headers = { 'X-Auth-Token': token, 'Content-Type': 'application/json' }
 
-  const execResp = await fetch(rpcUrl(podIp, port, '/exec'), {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ id, path: scriptPath }),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-  })
-  if (!execResp.ok) {
+  // Retry /exec on network errors and 5xx; throw immediately on 4xx
+  const maxExecAttempts = 3
+  const execRetryDelayMs = 1000
+  for (let attempt = 1; attempt <= maxExecAttempts; attempt++) {
+    let execResp: Response
+    try {
+      execResp = await fetch(rpcUrl(podIp, port, '/exec'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ id, path: scriptPath }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      })
+    } catch (fetchErr) {
+      if (attempt < maxExecAttempts) {
+        core.debug(
+          `RPC /exec network error (attempt ${attempt}/${maxExecAttempts}): ${fetchErr}`
+        )
+        await sleep(execRetryDelayMs)
+        continue
+      }
+      throw new Error(
+        `RPC /exec network error after ${maxExecAttempts} attempts: ${fetchErr}`
+      )
+    }
+
+    if (execResp.ok) {
+      break
+    }
+
+    if (execResp.status >= 400 && execResp.status < 500) {
+      const body = await execResp.text().catch(() => '')
+      throw new Error(`RPC /exec failed (${execResp.status}): ${body}`)
+    }
+
+    if (attempt < maxExecAttempts) {
+      core.debug(
+        `RPC /exec server error ${execResp.status} (attempt ${attempt}/${maxExecAttempts}), retrying`
+      )
+      await sleep(execRetryDelayMs)
+      continue
+    }
+
     const body = await execResp.text().catch(() => '')
-    throw new Error(`RPC /exec failed (${execResp.status}): ${body}`)
+    throw new Error(
+      `RPC /exec failed after ${maxExecAttempts} attempts (${execResp.status}): ${body}`
+    )
   }
 
   let lastSuccessfulHeartbeat = Date.now()
@@ -122,7 +182,6 @@ export async function rpcPodStep(
         lastSuccessfulHeartbeat = Date.now()
       } else if (Date.now() - lastSuccessfulHeartbeat > HEARTBEAT_GRACE_MS) {
         clearInterval(heartbeatInterval)
-        // The while loop below will also detect this via the flag
       }
     } catch {
       if (Date.now() - lastSuccessfulHeartbeat > HEARTBEAT_GRACE_MS) {
@@ -131,7 +190,8 @@ export async function rpcPodStep(
     }
   }, HEARTBEAT_INTERVAL_MS)
 
-  let byteOffset = 0
+  let stdoutOffset = 0
+  let stderrOffset = 0
   let exitCode = -1
 
   try {
@@ -140,21 +200,19 @@ export async function rpcPodStep(
         throw new Error('RPC heartbeat failed for 60s — infrastructure failure')
       }
 
-      // Log streaming
+      // Log streaming — stdout and stderr in parallel
       try {
-        const logResp = await fetch(
-          rpcUrl(podIp, port, `/logs?offset=${byteOffset}`),
-          {
-            headers: { 'X-Auth-Token': token },
-            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-          }
-        )
-        if (logResp.ok) {
-          const logData = await logResp.arrayBuffer()
-          if (logData.byteLength > 0) {
-            process.stdout.write(Buffer.from(logData))
-            byteOffset += logData.byteLength
-          }
+        const [stdoutData, stderrData] = await Promise.all([
+          fetchLogStream(podIp, port, token, 'stdout', stdoutOffset),
+          fetchLogStream(podIp, port, token, 'stderr', stderrOffset)
+        ])
+        if (stdoutData.byteLength > 0) {
+          process.stdout.write(Buffer.from(stdoutData))
+          stdoutOffset += stdoutData.byteLength
+        }
+        if (stderrData.byteLength > 0) {
+          process.stderr.write(Buffer.from(stderrData))
+          stderrOffset += stderrData.byteLength
         }
       } catch {
         core.debug('log fetch failed, will retry')
@@ -167,7 +225,7 @@ export async function rpcPodStep(
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
         })
         if (statusResp.ok) {
-          const status = await statusResp.json()
+          const status = (await statusResp.json()) as RpcStatusResponse
           if (status.status === 'completed' || status.status === 'failed') {
             exitCode = status.exit_code ?? -1
             break
@@ -180,19 +238,24 @@ export async function rpcPodStep(
       await sleep(LOG_POLL_INTERVAL_MS)
     }
 
-    // Final log flush
+    // Final log flush — drain all remaining data from both streams
     try {
-      const logResp = await fetch(
-        rpcUrl(podIp, port, `/logs?offset=${byteOffset}`),
-        {
-          headers: { 'X-Auth-Token': token },
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      let flushing = true
+      while (flushing) {
+        const [stdoutData, stderrData] = await Promise.all([
+          fetchLogStream(podIp, port, token, 'stdout', stdoutOffset),
+          fetchLogStream(podIp, port, token, 'stderr', stderrOffset)
+        ])
+        flushing = false
+        if (stdoutData.byteLength > 0) {
+          process.stdout.write(Buffer.from(stdoutData))
+          stdoutOffset += stdoutData.byteLength
+          flushing = true
         }
-      )
-      if (logResp.ok) {
-        const logData = await logResp.arrayBuffer()
-        if (logData.byteLength > 0) {
-          process.stdout.write(Buffer.from(logData))
+        if (stderrData.byteLength > 0) {
+          process.stderr.write(Buffer.from(stderrData))
+          stderrOffset += stderrData.byteLength
+          flushing = true
         }
       }
     } catch {
@@ -203,4 +266,24 @@ export async function rpcPodStep(
   } finally {
     clearInterval(heartbeatInterval)
   }
+}
+
+async function fetchLogStream(
+  podIp: string,
+  port: number,
+  token: string,
+  stream: 'stdout' | 'stderr',
+  offset: number
+): Promise<ArrayBuffer> {
+  const resp = await fetch(
+    rpcUrl(podIp, port, `/logs?stream=${stream}&offset=${offset}`),
+    {
+      headers: { 'X-Auth-Token': token },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    }
+  )
+  if (!resp.ok) {
+    return new ArrayBuffer(0)
+  }
+  return resp.arrayBuffer()
 }

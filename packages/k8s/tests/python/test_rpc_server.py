@@ -4,7 +4,7 @@ import json
 import subprocess
 import urllib.error
 import urllib.request
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch, call
 
 import pytest
 
@@ -22,13 +22,14 @@ def _req(base_url, path, method="GET", body=None, headers=None):
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status, resp.read()
+            more = resp.headers.get("X-More-Data")
+            return resp.status, resp.read(), more
     except urllib.error.HTTPError as e:
-        return e.code, e.read()
+        return e.code, e.read(), None
 
 
 def _json(base_url, path, **kwargs):
-    status, body = _req(base_url, path, **kwargs)
+    status, body, more = _req(base_url, path, **kwargs)
     return status, json.loads(body) if body else {}
 
 
@@ -102,6 +103,16 @@ class TestSendBytes:
         rpc_mod.Handler._send_bytes(h, b"abc")
         h.wfile.write.assert_called_once_with(b"abc")
 
+    def test_more_data_header_true(self, rpc_mod):
+        h = MagicMock()
+        rpc_mod.Handler._send_bytes(h, b"abc", more_data=True)
+        h.send_header.assert_any_call("X-More-Data", "true")
+
+    def test_more_data_header_false(self, rpc_mod):
+        h = MagicMock()
+        rpc_mod.Handler._send_bytes(h, b"abc", more_data=False)
+        h.send_header.assert_any_call("X-More-Data", "false")
+
 
 # ---------------------------------------------------------------------------
 # Unit tests: process management
@@ -140,21 +151,27 @@ class TestWaitForProcess:
 
 class TestStartExec:
     def test_starts_process(self, rpc_mod, log_dir):
-        with (
-            patch.object(rpc_mod.subprocess, "Popen") as mock_popen,
-            patch.object(rpc_mod.threading, "Thread") as mock_thr,
-        ):
+        with patch.object(rpc_mod.subprocess, "Popen") as mock_popen:
             mock_popen.return_value = MagicMock()
-            rpc_mod._start_exec("j1", "/tmp/s.sh")
+            proc, stdout_f, stderr_f = rpc_mod._start_exec("j1", "/tmp/s.sh")
 
-            assert rpc_mod._job_id == "j1"
-            assert rpc_mod._job_status == "running"
-            assert rpc_mod._exit_code is None
             call_args = mock_popen.call_args
             assert call_args[0][0] == ["sh", "-e", "/tmp/s.sh"]
             assert call_args[1]["start_new_session"] is True
-            mock_thr.return_value.start.assert_called_once()
-            assert (log_dir / "j1.log").exists()
+            assert (log_dir / "j1.stdout").exists()
+            assert (log_dir / "j1.stderr").exists()
+            stdout_f.close()
+            stderr_f.close()
+
+    def test_popen_failure_closes_files(self, rpc_mod, log_dir):
+        with patch.object(
+            rpc_mod.subprocess, "Popen", side_effect=OSError("boom")
+        ):
+            with pytest.raises(OSError, match="boom"):
+                rpc_mod._start_exec("j1", "/tmp/s.sh")
+            # Files should have been created then closed
+            assert (log_dir / "j1.stdout").exists()
+            assert (log_dir / "j1.stderr").exists()
 
 
 class TestKillProcess:
@@ -229,6 +246,24 @@ class TestKillProcess:
 
 
 # ---------------------------------------------------------------------------
+# Unit tests: helpers (_set_status, _set_globals)
+# ---------------------------------------------------------------------------
+
+class TestSetHelpers:
+    def test_set_status(self, rpc_mod):
+        rpc_mod._set_status("running")
+        assert rpc_mod._job_status == "running"
+
+    def test_set_globals(self, rpc_mod):
+        proc = MagicMock()
+        rpc_mod._set_globals("j1", "running", None, proc)
+        assert rpc_mod._job_id == "j1"
+        assert rpc_mod._job_status == "running"
+        assert rpc_mod._exit_code is None
+        assert rpc_mod._process is proc
+
+
+# ---------------------------------------------------------------------------
 # HTTP integration tests: endpoints
 # ---------------------------------------------------------------------------
 
@@ -241,23 +276,26 @@ class TestHealthEndpoint:
 
 class TestExecEndpoint:
     def test_missing_token(self, server):
-        status, _ = _req(server, "/exec", "POST", body={"id": "j", "path": "/s"})
+        status, _, _ = _req(server, "/exec", "POST", body={"id": "j", "path": "/s"})
         assert status == 403
 
-    def test_missing_all_fields(self, server):
-        status, _ = _req(
+    def test_missing_all_fields(self, server, rpc_mod):
+        rpc_mod._auth_token = "tok"
+        status, _, _ = _req(
             server, "/exec", "POST", body={}, headers={"X-Auth-Token": "tok"},
         )
         assert status == 400
 
-    def test_missing_path_only(self, server):
-        status, _ = _req(
+    def test_missing_path_only(self, server, rpc_mod):
+        rpc_mod._auth_token = "tok"
+        status, _, _ = _req(
             server, "/exec", "POST",
             body={"id": "j"}, headers={"X-Auth-Token": "tok"},
         )
         assert status == 400
 
     def test_success(self, rpc_mod, server, log_dir):
+        rpc_mod._auth_token = "tok"
         with patch.object(rpc_mod.subprocess, "Popen") as mock_popen:
             mock_popen.return_value = MagicMock()
             status, data = _json(
@@ -267,11 +305,10 @@ class TestExecEndpoint:
             )
         assert status == 200
         assert data["status"] == "running"
-        assert rpc_mod._auth_token == "tok"
 
-    def test_wrong_token_after_set(self, rpc_mod, server):
+    def test_wrong_token(self, rpc_mod, server):
         rpc_mod._auth_token = "correct"
-        status, _ = _req(
+        status, _, _ = _req(
             server, "/exec", "POST",
             body={"id": "j", "path": "/s"},
             headers={"X-Auth-Token": "wrong"},
@@ -288,10 +325,35 @@ class TestExecEndpoint:
         )
         assert status == 409
 
+    def test_job_starting_returns_409(self, rpc_mod, server):
+        rpc_mod._auth_token = "tok"
+        rpc_mod._job_status = "starting"
+        status, data = _json(
+            server, "/exec", method="POST",
+            body={"id": "j", "path": "/s"},
+            headers={"X-Auth-Token": "tok"},
+        )
+        assert status == 409
+
+    def test_popen_failure_returns_500(self, rpc_mod, server, log_dir):
+        rpc_mod._auth_token = "tok"
+        with patch.object(
+            rpc_mod.subprocess, "Popen", side_effect=OSError("spawn failed")
+        ):
+            status, data = _json(
+                server, "/exec", method="POST",
+                body={"id": "j1", "path": "/s.sh"},
+                headers={"X-Auth-Token": "tok"},
+            )
+        assert status == 500
+        assert "spawn failed" in data["error"]
+        # Status should revert to idle (the previous state)
+        assert rpc_mod._job_status == "idle"
+
 
 class TestStatusEndpoint:
     def test_requires_auth(self, server):
-        status, _ = _req(server, "/status")
+        status, _, _ = _req(server, "/status")
         assert status == 403
 
     def test_returns_status(self, rpc_mod, server):
@@ -306,28 +368,39 @@ class TestStatusEndpoint:
 
 class TestLogsEndpoint:
     def test_requires_auth(self, server):
-        status, _ = _req(server, "/logs")
+        status, _, _ = _req(server, "/logs")
         assert status == 403
 
     def test_no_job(self, rpc_mod, server):
         rpc_mod._auth_token = "tok"
-        status, body = _req(server, "/logs", headers={"X-Auth-Token": "tok"})
+        status, body, _ = _req(server, "/logs", headers={"X-Auth-Token": "tok"})
         assert status == 200
         assert body == b""
 
-    def test_with_data(self, rpc_mod, server, log_dir):
+    def test_stdout_default(self, rpc_mod, server, log_dir):
         rpc_mod._auth_token = "tok"
         rpc_mod._job_id = "j1"
-        (log_dir / "j1.log").write_bytes(b"hello")
-        status, body = _req(server, "/logs", headers={"X-Auth-Token": "tok"})
+        (log_dir / "j1.stdout").write_bytes(b"hello")
+        status, body, more = _req(server, "/logs", headers={"X-Auth-Token": "tok"})
         assert status == 200
         assert body == b"hello"
+        assert more == "false"
+
+    def test_stderr_stream(self, rpc_mod, server, log_dir):
+        rpc_mod._auth_token = "tok"
+        rpc_mod._job_id = "j1"
+        (log_dir / "j1.stderr").write_bytes(b"err output")
+        status, body, _ = _req(
+            server, "/logs?stream=stderr", headers={"X-Auth-Token": "tok"},
+        )
+        assert status == 200
+        assert body == b"err output"
 
     def test_with_offset(self, rpc_mod, server, log_dir):
         rpc_mod._auth_token = "tok"
         rpc_mod._job_id = "j1"
-        (log_dir / "j1.log").write_bytes(b"hello world")
-        status, body = _req(
+        (log_dir / "j1.stdout").write_bytes(b"hello world")
+        status, body, _ = _req(
             server, "/logs?offset=6", headers={"X-Auth-Token": "tok"},
         )
         assert status == 200
@@ -336,8 +409,8 @@ class TestLogsEndpoint:
     def test_offset_beyond_eof(self, rpc_mod, server, log_dir):
         rpc_mod._auth_token = "tok"
         rpc_mod._job_id = "j1"
-        (log_dir / "j1.log").write_bytes(b"hi")
-        status, body = _req(
+        (log_dir / "j1.stdout").write_bytes(b"hi")
+        status, body, _ = _req(
             server, "/logs?offset=999", headers={"X-Auth-Token": "tok"},
         )
         assert status == 200
@@ -346,8 +419,8 @@ class TestLogsEndpoint:
     def test_invalid_offset(self, rpc_mod, server, log_dir):
         rpc_mod._auth_token = "tok"
         rpc_mod._job_id = "j1"
-        (log_dir / "j1.log").write_bytes(b"hello")
-        status, body = _req(
+        (log_dir / "j1.stdout").write_bytes(b"hello")
+        status, body, _ = _req(
             server, "/logs?offset=abc", headers={"X-Auth-Token": "tok"},
         )
         assert status == 200
@@ -356,8 +429,8 @@ class TestLogsEndpoint:
     def test_multiple_query_params(self, rpc_mod, server, log_dir):
         rpc_mod._auth_token = "tok"
         rpc_mod._job_id = "j1"
-        (log_dir / "j1.log").write_bytes(b"hello world")
-        status, body = _req(
+        (log_dir / "j1.stdout").write_bytes(b"hello world")
+        status, body, _ = _req(
             server, "/logs?foo=bar&offset=6", headers={"X-Auth-Token": "tok"},
         )
         assert status == 200
@@ -366,14 +439,46 @@ class TestLogsEndpoint:
     def test_file_not_found(self, rpc_mod, server, log_dir):
         rpc_mod._auth_token = "tok"
         rpc_mod._job_id = "nonexistent"
-        status, body = _req(server, "/logs", headers={"X-Auth-Token": "tok"})
+        status, body, _ = _req(server, "/logs", headers={"X-Auth-Token": "tok"})
         assert status == 200
         assert body == b""
+
+    def test_chunked_read_more_data(self, rpc_mod, server, log_dir):
+        rpc_mod._auth_token = "tok"
+        rpc_mod._job_id = "j1"
+        # Write more than MAX_CHUNK (1 MB)
+        big = b"A" * (rpc_mod.MAX_CHUNK + 100)
+        (log_dir / "j1.stdout").write_bytes(big)
+        status, body, more = _req(server, "/logs", headers={"X-Auth-Token": "tok"})
+        assert status == 200
+        assert len(body) == rpc_mod.MAX_CHUNK
+        assert more == "true"
+
+    def test_invalid_stream_defaults_stdout(self, rpc_mod, server, log_dir):
+        rpc_mod._auth_token = "tok"
+        rpc_mod._job_id = "j1"
+        (log_dir / "j1.stdout").write_bytes(b"out")
+        status, body, _ = _req(
+            server, "/logs?stream=bogus", headers={"X-Auth-Token": "tok"},
+        )
+        assert status == 200
+        assert body == b"out"
+
+    def test_stream_and_offset(self, rpc_mod, server, log_dir):
+        rpc_mod._auth_token = "tok"
+        rpc_mod._job_id = "j1"
+        (log_dir / "j1.stderr").write_bytes(b"error detail")
+        status, body, _ = _req(
+            server, "/logs?stream=stderr&offset=6",
+            headers={"X-Auth-Token": "tok"},
+        )
+        assert status == 200
+        assert body == b"detail"
 
 
 class TestHeartbeatEndpoint:
     def test_requires_auth(self, server):
-        status, _ = _req(server, "/heartbeat", "POST")
+        status, _, _ = _req(server, "/heartbeat", "POST")
         assert status == 403
 
     def test_updates_heartbeat(self, rpc_mod, server):
@@ -390,12 +495,12 @@ class TestHeartbeatEndpoint:
 class TestUnknownEndpoints:
     def test_get_404(self, rpc_mod, server):
         rpc_mod._auth_token = "tok"
-        status, _ = _req(server, "/nope", headers={"X-Auth-Token": "tok"})
+        status, _, _ = _req(server, "/nope", headers={"X-Auth-Token": "tok"})
         assert status == 404
 
     def test_post_404(self, rpc_mod, server):
         rpc_mod._auth_token = "tok"
-        status, _ = _req(
+        status, _, _ = _req(
             server, "/nope", "POST", headers={"X-Auth-Token": "tok"},
         )
         assert status == 404
@@ -436,19 +541,28 @@ class TestHeartbeatWatchdog:
             with pytest.raises(RuntimeError, match="stop"):
                 rpc_mod._heartbeat_watchdog()
 
-    def test_timeout_kills_and_exits(self, rpc_mod):
+    def test_timeout_kills_process_not_daemon(self, rpc_mod):
+        """Watchdog kills the process but does NOT exit the daemon."""
         rpc_mod._last_heartbeat = 0
+        call_count = 0
+
+        def fake_sleep(_):
+            nonlocal call_count
+            call_count += 1
+            # First iteration triggers the timeout; second proves we loop.
+            if call_count >= 2:
+                raise RuntimeError("stop")
+
         with (
-            patch.object(rpc_mod.time, "sleep"),
+            patch.object(rpc_mod.time, "sleep", side_effect=fake_sleep),
             patch.object(rpc_mod.time, "time", return_value=100),
             patch.object(rpc_mod, "_kill_process") as mock_kill,
-            patch.object(rpc_mod.os, "_exit") as mock_exit,
         ):
-            mock_exit.side_effect = RuntimeError("exit")
-            with pytest.raises(RuntimeError, match="exit"):
+            with pytest.raises(RuntimeError, match="stop"):
                 rpc_mod._heartbeat_watchdog()
             mock_kill.assert_called_once()
-            mock_exit.assert_called_once_with(1)
+            # _last_heartbeat should be reset to None after killing
+            assert rpc_mod._last_heartbeat is None
 
 
 class TestSignalHandler:
@@ -462,7 +576,7 @@ class TestSignalHandler:
 class TestMain:
     def test_setup_and_serve(self, rpc_mod):
         with (
-            patch.object(rpc_mod.sys, "argv", ["s"]),
+            patch.object(rpc_mod.sys, "argv", ["s", "--token", "secret"]),
             patch.object(rpc_mod.os, "makedirs") as mock_mkdirs,
             patch.object(rpc_mod.signal, "signal") as mock_sig,
             patch.object(rpc_mod.threading, "Thread") as mock_thr,
@@ -476,10 +590,11 @@ class TestMain:
             assert mock_sig.call_count == 2
             mock_thr.return_value.start.assert_called_once()
             mock_cls.assert_called_once_with(("0.0.0.0", 8080), rpc_mod.Handler)
+            assert rpc_mod._auth_token == "secret"
 
     def test_custom_port(self, rpc_mod):
         with (
-            patch.object(rpc_mod.sys, "argv", ["s", "--port", "9999"]),
+            patch.object(rpc_mod.sys, "argv", ["s", "--port", "9999", "--token", "t"]),
             patch.object(rpc_mod.os, "makedirs"),
             patch.object(rpc_mod.signal, "signal"),
             patch.object(rpc_mod.threading, "Thread"),
@@ -490,3 +605,36 @@ class TestMain:
             with pytest.raises(RuntimeError):
                 rpc_mod.main()
             mock_cls.assert_called_once_with(("0.0.0.0", 9999), rpc_mod.Handler)
+
+    def test_missing_token_exits(self, rpc_mod):
+        with (
+            patch.object(rpc_mod.sys, "argv", ["s"]),
+        ):
+            with pytest.raises(SystemExit):
+                rpc_mod.main()
+
+
+class TestLogRequest:
+    def test_logs_non_heartbeat(self, rpc_mod, capsys):
+        h = MagicMock(spec=rpc_mod.Handler)
+        h.command = "GET"
+        h.path = "/status"
+        rpc_mod.Handler.log_request(h, code=200)
+        captured = capsys.readouterr()
+        assert "GET /status -> 200" in captured.out
+
+    def test_skips_heartbeat(self, rpc_mod, capsys):
+        h = MagicMock(spec=rpc_mod.Handler)
+        h.command = "POST"
+        h.path = "/heartbeat"
+        rpc_mod.Handler.log_request(h, code=200)
+        captured = capsys.readouterr()
+        assert captured.out == ""
+
+    def test_strips_query_string(self, rpc_mod, capsys):
+        h = MagicMock(spec=rpc_mod.Handler)
+        h.command = "GET"
+        h.path = "/logs?offset=100"
+        rpc_mod.Handler.log_request(h, code=200)
+        captured = capsys.readouterr()
+        assert "GET /logs -> 200" in captured.out

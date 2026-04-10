@@ -11,6 +11,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG_DIR = "/tmp/rpc-logs"
+MAX_CHUNK = 1048576  # 1 MB
 
 _lock = threading.Lock()
 _auth_token = None
@@ -55,14 +56,23 @@ def _wait_for_process(proc, job_id):
 
 
 def _start_exec(job_id, script_path):
-    global _job_id, _job_status, _exit_code, _process
-    with open(os.path.join(LOG_DIR, f"{job_id}.log"), "wb") as logfile:
+    """Open log files and spawn the subprocess. Called OUTSIDE the lock.
+
+    Returns (proc, stdout_file, stderr_file) on success.
+    Raises on failure (caller is responsible for cleanup).
+    """
+    stdout_file = open(os.path.join(LOG_DIR, f"{job_id}.stdout"), "wb")
+    stderr_file = open(os.path.join(LOG_DIR, f"{job_id}.stderr"), "wb")
+    try:
         proc = subprocess.Popen(
             ["sh", "-e", script_path],
-            stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True,
+            stdout=stdout_file, stderr=stderr_file, start_new_session=True,
         )
-    _job_id, _job_status, _exit_code, _process = job_id, "running", None, proc
-    threading.Thread(target=_wait_for_process, args=(proc, job_id), daemon=True).start()
+    except Exception:
+        stdout_file.close()
+        stderr_file.close()
+        raise
+    return proc, stdout_file, stderr_file
 
 def _kill_process():
     global _job_status, _exit_code
@@ -85,6 +95,12 @@ def _kill_process():
             _job_status = "failed"
 
 class Handler(BaseHTTPRequestHandler):
+    def log_request(self, code="-", size="-"):
+        path = self.path.split("?")[0] if self.path else self.path
+        if path == "/heartbeat":
+            return
+        print(f"{self.command} {path} -> {code}")
+
     def log_message(self, format, *args):
         pass
 
@@ -134,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def _handle_exec(self):
-        global _auth_token, _last_heartbeat
+        global _last_heartbeat
         token = self.headers.get("X-Auth-Token")
         if not token:
             self.send_error(403, "Missing auth token")
@@ -147,55 +163,97 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, "Missing id or path")
             return
 
+        # Step 1: Under lock — validate auth, check state, set sentinel.
         with _lock:
-            if _auth_token is None:
-                _auth_token = token
             if token != _auth_token:
-                result = ("error", 403, "Invalid auth token")
-            elif _job_status == "running":
-                result = ("json", 409, {"error": "A job is already running"})
-            else:
-                _start_exec(job_id, script_path)
-                _last_heartbeat = time.time()
-                result = ("json", 200, {"id": job_id, "status": "running"})
+                self.send_error(403, "Invalid auth token")
+                return
+            if _job_status in ("running", "starting"):
+                _send_json(self, {"error": "A job is already running"}, 409)
+                return
+            prev_status = _job_status
+            # "starting" sentinel prevents concurrent execs while we release
+            # the lock for I/O.
+            _set_status("starting")
 
-        if result[0] == "error":
-            self.send_error(result[1], result[2])
-        else:
-            _send_json(self, result[2], result[1])
+        # Step 2: Outside lock — open files, spawn process.
+        try:
+            proc, stdout_file, stderr_file = _start_exec(job_id, script_path)
+        except Exception as exc:
+            # Step 4: Re-acquire lock, revert sentinel.
+            with _lock:
+                _set_status(prev_status)
+            _send_json(self, {"error": str(exc)}, 500)
+            return
 
-    def _send_bytes(self, data):
+        # Step 3: Under lock — commit running state.
+        with _lock:
+            _set_globals(job_id, "running", None, proc)
+            _last_heartbeat = time.time()
+
+        threading.Thread(
+            target=_wait_for_process, args=(proc, job_id), daemon=True,
+        ).start()
+        _send_json(self, {"id": job_id, "status": "running"})
+
+    def _send_bytes(self, data, more_data=False):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-More-Data", "true" if more_data else "false")
         self.end_headers()
         if data:
             self.wfile.write(data)
 
     def _handle_logs(self):
         offset = 0
+        stream = "stdout"
         qs = self.path.split("?", 1)
         if len(qs) > 1:
             for p in qs[1].split("&"):
                 if p.startswith("offset="):
                     with contextlib.suppress(ValueError):
                         offset = int(p.split("=", 1)[1])
+                elif p.startswith("stream="):
+                    val = p.split("=", 1)[1]
+                    if val in ("stdout", "stderr"):
+                        stream = val
         with _lock:
             job_id = _job_id
         if job_id is None:
             return self._send_bytes(b"")
+        log_file = os.path.join(LOG_DIR, f"{job_id}.{stream}")
         try:
-            with open(os.path.join(LOG_DIR, f"{job_id}.log"), "rb") as f:
+            with open(log_file, "rb") as f:
                 f.seek(0, 2)
                 size = f.tell()
                 if offset >= size:
                     return self._send_bytes(b"")
                 f.seek(offset)
-                self._send_bytes(f.read())
+                chunk = f.read(MAX_CHUNK)
+                remaining = size - offset - len(chunk)
+                self._send_bytes(chunk, more_data=(remaining > 0))
         except FileNotFoundError:
             self._send_bytes(b"")
 
+
+def _set_status(status):
+    """Set _job_status (must be called with _lock held)."""
+    global _job_status
+    _job_status = status
+
+
+def _set_globals(job_id, status, exit_code, process):
+    """Set all job-related globals (must be called with _lock held)."""
+    global _job_id, _job_status, _exit_code, _process
+    _job_id = job_id
+    _job_status = status
+    _exit_code = exit_code
+    _process = process
+
+
 def _heartbeat_watchdog():
+    global _last_heartbeat
     while True:
         time.sleep(5)
         with _lock:
@@ -203,11 +261,12 @@ def _heartbeat_watchdog():
         if last is None:
             continue
         if time.time() - last > 60:
-            sys.stderr.write(
-                "Heartbeat timeout: no heartbeat received for 60s, shutting down\n"
+            print(
+                "Heartbeat timeout: no heartbeat for 60s, killing current process"
             )
             _kill_process()
-            os._exit(1)
+            with _lock:
+                _last_heartbeat = None
 
 def _signal_handler(signum, frame):
     _kill_process()
@@ -216,7 +275,11 @@ def _signal_handler(signum, frame):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--token", type=str, required=True)
     args = parser.parse_args()
+
+    global _auth_token
+    _auth_token = args.token
 
     os.makedirs(LOG_DIR, exist_ok=True)
 

@@ -12,4 +12,15 @@ const tsContent = `// Auto-generated from rpc-server.py — do not edit directly
 export const RPC_SERVER_SCRIPT = ${JSON.stringify(pySource)}
 `
 
+if (process.argv.includes('--verify')) {
+  const existing = fs.existsSync(tsPath) ? fs.readFileSync(tsPath, 'utf-8') : ''
+  if (existing !== tsContent) {
+    console.error(
+      "rpc-server-script.ts is stale. Run 'node scripts/embed-rpc-server.js' to regenerate."
+    )
+    process.exit(1)
+  }
+  process.exit(0)
+}
+
 fs.writeFileSync(tsPath, tsContent)

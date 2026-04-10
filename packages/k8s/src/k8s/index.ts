@@ -410,7 +410,7 @@ export async function execPodStepWithRetry(
   podName: string,
   containerName: string,
   description: string,
-  maxAttempts = 7,
+  maxAttempts = 6,
   initialDelayMs = 1000
 ): Promise<number> {
   let lastError: Error | undefined
@@ -1168,7 +1168,7 @@ export function containerPorts(
   return ports
 }
 
-export async function getPodByName(name): Promise<k8s.V1Pod> {
+export async function getPodByName(name: string): Promise<k8s.V1Pod> {
   return await k8sApi.readNamespacedPod({
     name,
     namespace: namespace()

@@ -40,7 +40,7 @@ import { deployRpcServer } from '../k8s/rpc'
 
 export async function prepareJob(
   args: PrepareJobArgs,
-  responseFile
+  responseFile: string
 ): Promise<void> {
   if (!args.container) {
     throw new Error('Job Container is required.')
@@ -163,11 +163,12 @@ export async function prepareJob(
   }
   core.debug(`Setting isAlpine to ${isAlpine}`)
 
+  const rpcToken = crypto.randomUUID()
   const { podIp: rpcPodIp, port: rpcPort } = await deployRpcServer(
     createdPod.metadata.name,
-    JOB_CONTAINER_NAME
+    JOB_CONTAINER_NAME,
+    rpcToken
   )
-  const rpcToken = crypto.randomUUID()
   core.debug(`RPC server deployed at ${rpcPodIp}:${rpcPort}`)
 
   generateResponseFile(responseFile, args, createdPod, isAlpine, {
