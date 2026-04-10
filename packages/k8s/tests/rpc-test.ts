@@ -4,10 +4,12 @@
 
 const MOCK_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 
+const mockExecPodStep = jest.fn()
 const mockExecPodStepWithRetry = jest.fn()
 const mockGetPodByName = jest.fn()
 
 jest.mock('../src/k8s', () => ({
+  execPodStep: (...args) => mockExecPodStep(...args),
   execPodStepWithRetry: (...args) => mockExecPodStepWithRetry(...args),
   getPodByName: (...args) => mockGetPodByName(...args)
 }))
@@ -77,12 +79,8 @@ function fakeResponse(
 // ---------------------------------------------------------------------------
 
 describe('deployRpcServer', () => {
-  let fetchMock: jest.Mock
-
   beforeEach(() => {
     jest.clearAllMocks()
-    fetchMock = jest.fn()
-    global.fetch = fetchMock
 
     // Deterministic port for tests
     jest.spyOn(Math, 'random').mockReturnValue(0.5) // port = floor(0.5 * 50000) + 10000 = 35000
@@ -94,6 +92,9 @@ describe('deployRpcServer', () => {
 
     // Default: all execPodStepWithRetry calls succeed
     mockExecPodStepWithRetry.mockResolvedValue(0)
+
+    // Default: health check succeeds (execPodStep returns 0)
+    mockExecPodStep.mockResolvedValue(0)
   })
 
   afterEach(() => {
@@ -101,9 +102,6 @@ describe('deployRpcServer', () => {
   })
 
   it('should check python3 availability via execPodStepWithRetry', async () => {
-    // Health check passes immediately
-    fetchMock.mockResolvedValueOnce(fakeResponse(200, { status: 'ok' }))
-
     await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
     // First exec call should be the python3 --version check
@@ -135,8 +133,6 @@ describe('deployRpcServer', () => {
   })
 
   it('should deploy the server script via base64 encoding', async () => {
-    fetchMock.mockResolvedValueOnce(fakeResponse(200, { status: 'ok' }))
-
     await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
     // Second exec call: write rpc server
@@ -150,8 +146,6 @@ describe('deployRpcServer', () => {
   })
 
   it('should start the server with correct --port and --token args', async () => {
-    fetchMock.mockResolvedValueOnce(fakeResponse(200, { status: 'ok' }))
-
     await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
     // Third exec call: start rpc server
@@ -166,20 +160,16 @@ describe('deployRpcServer', () => {
 
   it('should poll health until server is ready and return podIp and port', async () => {
     // First health check fails, second succeeds
-    fetchMock
-      .mockResolvedValueOnce(fakeResponse(503))
-      .mockResolvedValueOnce(fakeResponse(200, { status: 'ok' }))
+    mockExecPodStep.mockResolvedValueOnce(1).mockResolvedValueOnce(0)
 
     const result = await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
     expect(result).toEqual({ podIp: '10.0.0.1', port: 35000 })
-    // fetch was called at least twice for health checks
-    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2)
+    // execPodStep was called at least twice for health checks
+    expect(mockExecPodStep.mock.calls.length).toBeGreaterThanOrEqual(2)
   })
 
   it('should return on first health check success', async () => {
-    fetchMock.mockResolvedValueOnce(fakeResponse(200, { status: 'ok' }))
-
     const result = await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
     expect(result).toEqual({ podIp: '10.0.0.1', port: 35000 })
@@ -203,14 +193,15 @@ describe('deployRpcServer', () => {
     let timeOffset = 0
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
 
-    fetchMock.mockImplementation(async (url: string) => {
-      if (url.includes(':35000')) {
+    mockExecPodStep.mockImplementation(async (cmd: string[]) => {
+      const cmdStr = cmd[2] || ''
+      if (cmdStr.includes(':35000')) {
         // First port: fail and advance time beyond 30s timeout
         timeOffset += 31000
-        return Promise.resolve(fakeResponse(503))
+        return 1
       }
       // Second port (20000): succeed immediately
-      return Promise.resolve(fakeResponse(200, { status: 'ok' }))
+      return 0
     })
 
     const result = await deployRpcServer('my-pod', 'my-container', 'tok-123')
@@ -233,10 +224,10 @@ describe('deployRpcServer', () => {
 
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
 
-    fetchMock.mockImplementation(async () => {
+    mockExecPodStep.mockImplementation(async () => {
       // Advance time beyond health timeout on each call
       timeOffset += 31000
-      return Promise.resolve(fakeResponse(503))
+      return 1
     })
 
     await expect(
@@ -253,9 +244,9 @@ describe('deployRpcServer', () => {
 
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
 
-    fetchMock.mockImplementation(async () => {
+    mockExecPodStep.mockImplementation(async () => {
       timeOffset += 31000
-      return Promise.reject(new Error('network unreachable'))
+      throw new Error('exec failed')
     })
 
     await expect(

@@ -1,7 +1,7 @@
 import * as core from '@actions/core'
 import * as crypto from 'crypto'
 import { sleep } from './utils'
-import { execPodStepWithRetry, getPodByName } from './index'
+import { execPodStep, execPodStepWithRetry, getPodByName } from './index'
 import { RPC_SERVER_SCRIPT } from './rpc-server-script'
 
 interface RpcStatusResponse {
@@ -22,12 +22,22 @@ function rpcUrl(podIp: string, port: number, path: string): string {
   return `http://${podIp}:${port}${path}`
 }
 
-async function healthCheck(podIp: string, port: number): Promise<boolean> {
+async function healthCheck(
+  podName: string,
+  containerName: string,
+  port: number
+): Promise<boolean> {
   try {
-    const resp = await fetch(rpcUrl(podIp, port, '/health'), {
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-    })
-    return resp.status === 200
+    const exitCode = await execPodStep(
+      [
+        'python3',
+        '-c',
+        `import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/health')`
+      ],
+      podName,
+      containerName
+    )
+    return exitCode === 0
   } catch {
     return false
   }
@@ -91,7 +101,7 @@ export async function deployRpcServer(
     const startTime = Date.now()
     let healthy = false
     while (Date.now() - startTime < HEALTH_TIMEOUT_MS) {
-      if (await healthCheck(podIp, port)) {
+      if (await healthCheck(podName, containerName, port)) {
         core.debug(`RPC server healthy after ${Date.now() - startTime}ms`)
         healthy = true
         break
