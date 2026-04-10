@@ -34,7 +34,9 @@ import {
   getJobPodName,
   JOB_CONTAINER_NAME
 } from './constants'
+import * as crypto from 'crypto'
 import { dirname } from 'path'
+import { deployRpcServer } from '../k8s/rpc'
 
 export async function prepareJob(
   args: PrepareJobArgs,
@@ -160,21 +162,35 @@ export async function prepareJob(
     throw new Error(`failed to determine if the pod is alpine: ${message}`)
   }
   core.debug(`Setting isAlpine to ${isAlpine}`)
-  generateResponseFile(responseFile, args, createdPod, isAlpine)
+
+  const { podIp: rpcPodIp, port: rpcPort } = await deployRpcServer(
+    createdPod.metadata.name,
+    JOB_CONTAINER_NAME
+  )
+  const rpcToken = crypto.randomUUID()
+  core.debug(`RPC server deployed at ${rpcPodIp}:${rpcPort}`)
+
+  generateResponseFile(responseFile, args, createdPod, isAlpine, {
+    rpcPodIp,
+    rpcPort,
+    rpcToken
+  })
 }
 
 function generateResponseFile(
   responseFile: string,
   args: PrepareJobArgs,
   appPod: k8s.V1Pod,
-  isAlpine: boolean
+  isAlpine: boolean,
+  rpcState: { rpcPodIp: string; rpcPort: number; rpcToken: string }
 ): void {
   if (!appPod.metadata?.name) {
     throw new Error('app pod must have metadata.name specified')
   }
   const response = {
     state: {
-      jobPod: appPod.metadata.name
+      jobPod: appPod.metadata.name,
+      ...rpcState
     },
     context: {},
     isAlpine

@@ -2,16 +2,11 @@
 import * as fs from 'fs'
 import * as core from '@actions/core'
 import { RunScriptStepArgs } from 'hooklib'
-import {
-  execCpFromPod,
-  execCpToPod,
-  execPodStep,
-  execPodStepWithRetry
-} from '../k8s'
-import { writeRunScript, sleep, listDirAllCommand } from '../k8s/utils'
+import { execCpFromPod, execCpToPod, execPodStepWithRetry } from '../k8s'
+import { rpcPodStep } from '../k8s/rpc'
+import { writeRunScript } from '../k8s/utils'
 import { JOB_CONTAINER_NAME } from './constants'
 import { dirname } from 'path'
-import * as shlex from 'shlex'
 
 export async function runScriptStep(
   args: RunScriptStepArgs,
@@ -91,13 +86,12 @@ export async function runScriptStep(
   // Execute the entrypoint script — propagate exit code to the caller
   // so the runner can mark the step as failed when the user's script fails.
   let exitCode: number
-  args.entryPoint = 'sh'
-  args.entryPointArgs = ['-e', containerPath]
   try {
-    exitCode = await execPodStep(
-      [args.entryPoint, ...args.entryPointArgs],
-      state.jobPod,
-      JOB_CONTAINER_NAME
+    exitCode = await rpcPodStep(
+      state.rpcPodIp,
+      state.rpcPort,
+      containerPath,
+      state.rpcToken
     )
   } catch (err) {
     core.debug(`execPodStep failed: ${JSON.stringify(err)}`)
