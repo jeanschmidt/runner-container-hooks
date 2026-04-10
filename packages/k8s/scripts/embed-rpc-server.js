@@ -9,6 +9,7 @@ const pySource = fs.readFileSync(pyPath, 'utf-8')
 
 const tsContent = `// Auto-generated from rpc-server.py — do not edit directly.
 // To update: edit src/k8s/rpc-server.py and run: node scripts/embed-rpc-server.js
+// prettier-ignore
 export const RPC_SERVER_SCRIPT = ${JSON.stringify(pySource)}
 `
 

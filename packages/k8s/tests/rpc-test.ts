@@ -390,7 +390,11 @@ describe('rpcPodStep', () => {
       }
       if (urlStr.includes('/status')) {
         return Promise.resolve(
-          fakeResponse(200, { id: 'test', status: 'completed', exit_code: null })
+          fakeResponse(200, {
+            id: 'test',
+            status: 'completed',
+            exit_code: null
+          })
         )
       }
       if (urlStr.includes('/heartbeat')) {
@@ -606,9 +610,9 @@ describe('rpcPodStep', () => {
       .mockRejectedValueOnce(netErr)
       .mockRejectedValueOnce(netErr)
 
-    await expect(
-      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
-    ).rejects.toThrow('RPC /exec network error after 3 attempts')
+    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
+      'RPC /exec network error after 3 attempts'
+    )
   })
 
   it('should succeed if /exec network error recovers on retry', async () => {
@@ -652,9 +656,9 @@ describe('rpcPodStep', () => {
       .mockResolvedValueOnce(fakeResponse(502, 'bad gateway'))
       .mockResolvedValueOnce(fakeResponse(503, 'service unavailable'))
 
-    await expect(
-      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
-    ).rejects.toThrow('RPC /exec failed after 3 attempts')
+    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
+      'RPC /exec failed after 3 attempts'
+    )
   })
 
   it('should succeed if /exec 5xx recovers on retry', async () => {
@@ -692,9 +696,9 @@ describe('rpcPodStep', () => {
   it('should throw immediately on /exec 4xx without retry', async () => {
     fetchMock.mockResolvedValueOnce(fakeResponse(400, 'bad request'))
 
-    await expect(
-      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
-    ).rejects.toThrow('RPC /exec failed (400)')
+    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
+      'RPC /exec failed (400)'
+    )
 
     // Only one /exec call should have been made (no retries)
     const execCalls = fetchMock.mock.calls.filter(
@@ -706,9 +710,9 @@ describe('rpcPodStep', () => {
   it('should throw immediately on /exec 403', async () => {
     fetchMock.mockResolvedValueOnce(fakeResponse(403, 'forbidden'))
 
-    await expect(
-      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
-    ).rejects.toThrow('RPC /exec failed (403)')
+    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
+      'RPC /exec failed (403)'
+    )
   })
 
   it('should throw immediately on /exec 409', async () => {
@@ -716,9 +720,9 @@ describe('rpcPodStep', () => {
       fakeResponse(409, 'A job is already running')
     )
 
-    await expect(
-      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
-    ).rejects.toThrow('RPC /exec failed (409)')
+    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
+      'RPC /exec failed (409)'
+    )
   })
 
   it('should send heartbeats during execution', async () => {
@@ -840,9 +844,9 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    await expect(
-      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
-    ).rejects.toThrow('RPC heartbeat failed for 60s')
+    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
+      'RPC heartbeat failed for 60s'
+    )
   })
 
   it('should handle /status fetch failures gracefully (retry)', async () => {
@@ -1023,9 +1027,9 @@ describe('rpcPodStep', () => {
       fakeResponse(422, 'Unprocessable: missing required field "id"')
     )
 
-    await expect(
-      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
-    ).rejects.toThrow('RPC /exec failed (422)')
+    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
+      'RPC /exec failed (422)'
+    )
   })
 
   it('should handle /exec response where text() throws', async () => {
@@ -1047,8 +1051,8 @@ describe('rpcPodStep', () => {
 
     fetchMock.mockResolvedValueOnce(badResp)
 
-    await expect(
-      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
-    ).rejects.toThrow('RPC /exec failed (400)')
+    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
+      'RPC /exec failed (400)'
+    )
   })
 })
