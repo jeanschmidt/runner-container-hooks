@@ -203,7 +203,7 @@ describe('deployRpcServer', () => {
     let timeOffset = 0
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
 
-    fetchMock.mockImplementation((url: string) => {
+    fetchMock.mockImplementation(async (url: string) => {
       if (url.includes(':35000')) {
         // First port: fail and advance time beyond 30s timeout
         timeOffset += 31000
@@ -233,7 +233,7 @@ describe('deployRpcServer', () => {
 
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
 
-    fetchMock.mockImplementation(() => {
+    fetchMock.mockImplementation(async () => {
       // Advance time beyond health timeout on each call
       timeOffset += 31000
       return Promise.resolve(fakeResponse(503))
@@ -253,7 +253,7 @@ describe('deployRpcServer', () => {
 
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
 
-    fetchMock.mockImplementation(() => {
+    fetchMock.mockImplementation(async () => {
       timeOffset += 31000
       return Promise.reject(new Error('network unreachable'))
     })
@@ -299,7 +299,7 @@ describe('rpcPodStep', () => {
    * flow in a single pass. Returns the exit code provided.
    */
   function setupSimpleExecFlow(exitCode: number, status = 'completed'): void {
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
 
       // /exec POST
@@ -378,7 +378,7 @@ describe('rpcPodStep', () => {
   })
 
   it('should return -1 when exit_code is null', async () => {
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
@@ -412,7 +412,7 @@ describe('rpcPodStep', () => {
     const stdoutData = new TextEncoder().encode('hello stdout\n')
     let statusCallCount = 0
 
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
@@ -474,7 +474,7 @@ describe('rpcPodStep', () => {
     const stderrData = new TextEncoder().encode('error output\n')
     let statusCallCount = 0
 
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
@@ -532,7 +532,7 @@ describe('rpcPodStep', () => {
     let stdoutCallIdx = 0
     let statusCallCount = 0
 
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
@@ -619,7 +619,7 @@ describe('rpcPodStep', () => {
     const netErr = new Error('ECONNREFUSED')
 
     let execCallCount = 0
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         // Fail first, succeed second
@@ -663,7 +663,7 @@ describe('rpcPodStep', () => {
 
   it('should succeed if /exec 5xx recovers on retry', async () => {
     let execCallCount = 0
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         execCallCount++
@@ -733,16 +733,17 @@ describe('rpcPodStep', () => {
     // and sleep.
     jest.useFakeTimers()
 
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
     const { sleep: mockSleep } = require('../src/k8s/utils') as {
       sleep: jest.Mock
     }
     mockSleep.mockImplementation(
-      (ms: number) => new Promise(r => setTimeout(r, ms))
+      async (ms: number) => new Promise(r => setTimeout(r, ms))
     )
 
     let statusCallCount = 0
 
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
@@ -820,7 +821,7 @@ describe('rpcPodStep', () => {
 
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
 
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
@@ -852,7 +853,7 @@ describe('rpcPodStep', () => {
   it('should handle /status fetch failures gracefully (retry)', async () => {
     let statusCallCount = 0
 
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
@@ -888,7 +889,7 @@ describe('rpcPodStep', () => {
   it('should handle /logs fetch failures gracefully (continue polling)', async () => {
     let logsCallCount = 0
 
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
@@ -930,7 +931,7 @@ describe('rpcPodStep', () => {
     let statusCallCount = 0
     let postCompletionLogFetch = false
 
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
@@ -982,7 +983,7 @@ describe('rpcPodStep', () => {
   })
 
   it('should handle non-200 /logs response (return empty)', async () => {
-    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
       if (urlStr.includes('/exec') && init?.method === 'POST') {
         return Promise.resolve(fakeResponse(200, { status: 'running' }))
