@@ -760,6 +760,35 @@ export async function execCpFromPod(
           )
           .catch(e => reject(e))
       })
+
+      // Wait for the tar extraction stream to finish writing all data
+      // to disk. The K8s exec status callback fires when the remote
+      // command exits, but stdout data may still be in transit through
+      // the WebSocket pipeline. Without this, callers that immediately
+      // access the extracted files can hit ENOENT race conditions.
+      if (!writerStream.writableFinished) {
+        await new Promise<void>((resolve, reject) => {
+          let settled = false
+          const done = (err?: Error | null): void => {
+            if (settled) return
+            settled = true
+            cleanupFn()
+            clearTimeout(timer)
+            if (err) {
+              reject(err)
+            } else {
+              resolve()
+            }
+          }
+          const cleanupFn = stream.finished(writerStream, err => {
+            done(err)
+          })
+          const timer = setTimeout(() => {
+            done(new Error('tar extract stream drain timed out after 10s'))
+          }, 10000)
+        })
+      }
+
       break
     } catch (error) {
       core.debug(`Attempt ${attempt + 1} failed: ${error}`)
