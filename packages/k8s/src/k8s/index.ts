@@ -784,8 +784,9 @@ export async function execCpFromPod(
             done(err)
           })
           const timer = setTimeout(() => {
-            done(new Error('tar extract stream drain timed out after 10s'))
-          }, 10000)
+            writerStream.destroy()
+            done(new Error('tar extract stream drain timed out after 90s'))
+          }, 90000)
         })
       }
 
