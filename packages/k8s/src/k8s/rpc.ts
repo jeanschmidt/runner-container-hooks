@@ -119,7 +119,11 @@ export async function deployRpcServer(
 
     // Kill any server from a previous failed attempt and clean up port file
     await execPodStep(
-      ['sh', '-c', `pkill -f 'python3 /tmp/rpc-server.py' 2>/dev/null; rm -f ${PORT_FILE}`],
+      [
+        'sh',
+        '-c',
+        `pkill -f 'python3 /tmp/rpc-server.py' 2>/dev/null; rm -f ${PORT_FILE}`
+      ],
       podName,
       containerName
     )

@@ -231,9 +231,7 @@ describe('deployRpcServer', () => {
 
     await expect(
       deployRpcServer('my-pod', 'my-container', 'tok-123')
-    ).rejects.toThrow(
-      'RPC server failed to become healthy after 3 attempts'
-    )
+    ).rejects.toThrow('RPC server failed to become healthy after 3 attempts')
   })
 
   it('should handle health check network errors', async () => {
@@ -255,9 +253,7 @@ describe('deployRpcServer', () => {
 
     await expect(
       deployRpcServer('my-pod', 'my-container', 'tok-123')
-    ).rejects.toThrow(
-      'RPC server failed to become healthy after 3 attempts'
-    )
+    ).rejects.toThrow('RPC server failed to become healthy after 3 attempts')
   })
 })
 

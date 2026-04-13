@@ -536,9 +536,7 @@ export async function execPodStepOutput(
         false /* tty */,
         resp => {
           settled = true
-          const stdout = (
-            stdoutBuffer.getContentsAsString('utf8') || ''
-          ).trim()
+          const stdout = (stdoutBuffer.getContentsAsString('utf8') || '').trim()
           if (resp.status === 'Success') {
             resolve({ exitCode: 0, stdout })
           } else {
@@ -565,9 +563,7 @@ export async function execPodStepOutput(
           ws.on('error', (err: Error) => {
             if (!settled) {
               settled = true
-              core.warning(
-                `execPodStepOutput: WebSocket error: ${err.message}`
-              )
+              core.warning(`execPodStepOutput: WebSocket error: ${err.message}`)
               const stdout = (
                 stdoutBuffer.getContentsAsString('utf8') || ''
               ).trim()
