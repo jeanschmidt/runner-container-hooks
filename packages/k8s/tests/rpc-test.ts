@@ -1342,4 +1342,346 @@ describe('rpcPodStep', () => {
       rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
     ).rejects.toThrow('RPC /exec failed (400)')
   })
+
+  // -------------------------------------------------------------------
+  // Scenario tests — long-running, cancellation, OOM, sudden pod death
+  // -------------------------------------------------------------------
+
+  it('should stream stdout and stderr over many poll cycles (long-running script)', async () => {
+    // Simulates a process running for many poll iterations, producing
+    // new stdout/stderr chunks periodically, with heartbeats succeeding.
+    const totalPolls = 30
+    let statusCallCount = 0
+    let stdoutCallCount = 0
+    let stderrCallCount = 0
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/exec') && init?.method === 'POST') {
+        return Promise.resolve(fakeResponse(200, { status: 'running' }))
+      }
+      if (urlStr.includes('/logs') && urlStr.includes('stream=stdout')) {
+        stdoutCallCount++
+        // Produce a chunk every 5 polls
+        if (stdoutCallCount % 5 === 0 && statusCallCount < totalPolls) {
+          const chunk = new TextEncoder().encode(
+            `stdout line ${stdoutCallCount}\n`
+          )
+          return Promise.resolve(
+            fakeResponse(200, null, {
+              arrayBuffer: chunk.buffer.slice(
+                chunk.byteOffset,
+                chunk.byteOffset + chunk.byteLength
+              )
+            })
+          )
+        }
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/logs') && urlStr.includes('stream=stderr')) {
+        stderrCallCount++
+        // Produce stderr every 7 polls
+        if (stderrCallCount % 7 === 0 && statusCallCount < totalPolls) {
+          const chunk = new TextEncoder().encode(
+            `stderr warning ${stderrCallCount}\n`
+          )
+          return Promise.resolve(
+            fakeResponse(200, null, {
+              arrayBuffer: chunk.buffer.slice(
+                chunk.byteOffset,
+                chunk.byteOffset + chunk.byteLength
+              )
+            })
+          )
+        }
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/status')) {
+        statusCallCount++
+        if (statusCallCount >= totalPolls) {
+          return Promise.resolve(
+            fakeResponse(200, { status: 'completed', exit_code: 0 })
+          )
+        }
+        return Promise.resolve(
+          fakeResponse(200, { status: 'running', exit_code: null })
+        )
+      }
+      if (urlStr.includes('/heartbeat')) {
+        return Promise.resolve(fakeResponse(200, { status: 'ok' }))
+      }
+      return Promise.reject(new Error(`Unexpected: ${urlStr}`))
+    })
+
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
+
+    expect(exitCode).toBe(0)
+    // Verify multiple stdout and stderr writes occurred
+    expect(stdoutWriteSpy.mock.calls.length).toBeGreaterThanOrEqual(5)
+    expect(stderrWriteSpy.mock.calls.length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('should handle process killed mid-execution (cancelled job)', async () => {
+    // Process runs for several polls producing logs, then is killed externally.
+    // Status changes from running to failed with exit code 143 (SIGTERM).
+    let statusCallCount = 0
+    const killAfterPolls = 5
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/exec') && init?.method === 'POST') {
+        return Promise.resolve(fakeResponse(200, { status: 'running' }))
+      }
+      if (urlStr.includes('/logs') && urlStr.includes('stream=stdout')) {
+        if (statusCallCount < killAfterPolls) {
+          const chunk = new TextEncoder().encode('running...\n')
+          return Promise.resolve(
+            fakeResponse(200, null, {
+              arrayBuffer: chunk.buffer.slice(
+                chunk.byteOffset,
+                chunk.byteOffset + chunk.byteLength
+              )
+            })
+          )
+        }
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/logs') && urlStr.includes('stream=stderr')) {
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/status')) {
+        statusCallCount++
+        if (statusCallCount > killAfterPolls) {
+          // Process was killed — SIGTERM = exit code 143 (128 + 15)
+          return Promise.resolve(
+            fakeResponse(200, { status: 'failed', exit_code: 143 })
+          )
+        }
+        return Promise.resolve(
+          fakeResponse(200, { status: 'running', exit_code: null })
+        )
+      }
+      if (urlStr.includes('/heartbeat')) {
+        return Promise.resolve(fakeResponse(200, { status: 'ok' }))
+      }
+      return Promise.reject(new Error(`Unexpected: ${urlStr}`))
+    })
+
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
+
+    expect(exitCode).toBe(143)
+    // Some stdout was produced before the kill
+    expect(stdoutWriteSpy).toHaveBeenCalled()
+  })
+
+  it('should handle OOM kill on the script (exit code 137 with log streaming)', async () => {
+    // Script runs, producing logs, then is OOM killed. The RPC server
+    // catches the exit and reports status: failed, exit_code: 137.
+    let statusCallCount = 0
+    const oomAfterPolls = 8
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/exec') && init?.method === 'POST') {
+        return Promise.resolve(fakeResponse(200, { status: 'running' }))
+      }
+      if (urlStr.includes('/logs') && urlStr.includes('stream=stdout')) {
+        if (statusCallCount <= oomAfterPolls) {
+          const chunk = new TextEncoder().encode('allocating memory...\n')
+          return Promise.resolve(
+            fakeResponse(200, null, {
+              arrayBuffer: chunk.buffer.slice(
+                chunk.byteOffset,
+                chunk.byteOffset + chunk.byteLength
+              )
+            })
+          )
+        }
+        // After OOM, no more output
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/logs') && urlStr.includes('stream=stderr')) {
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/status')) {
+        statusCallCount++
+        if (statusCallCount > oomAfterPolls) {
+          // SIGKILL from OOM killer: 128 + 9 = 137
+          return Promise.resolve(
+            fakeResponse(200, { status: 'failed', exit_code: 137 })
+          )
+        }
+        return Promise.resolve(
+          fakeResponse(200, { status: 'running', exit_code: null })
+        )
+      }
+      if (urlStr.includes('/heartbeat')) {
+        return Promise.resolve(fakeResponse(200, { status: 'ok' }))
+      }
+      return Promise.reject(new Error(`Unexpected: ${urlStr}`))
+    })
+
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
+
+    expect(exitCode).toBe(137)
+    expect(stdoutWriteSpy).toHaveBeenCalled()
+  })
+
+  it('should handle OOM kill on workflow pod (all fetches fail, then diagnostic)', async () => {
+    // Pod OOM: after some successful polls, ALL fetches start failing.
+    // Heartbeat grace period elapses, then diagnostic reveals OOMKilled.
+    const realDateNow = Date.now
+    const startTime = realDateNow()
+    let timeOffset = 0
+    let statusCallCount = 0
+    const oomAfterPolls = 3
+
+    jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
+
+    mockGetPodByName.mockResolvedValue({
+      status: {
+        phase: 'Failed',
+        podIP: POD_IP,
+        containerStatuses: [
+          {
+            name: CONTAINER_NAME,
+            state: {
+              terminated: { reason: 'OOMKilled', exitCode: 137 }
+            }
+          }
+        ]
+      }
+    })
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/exec') && init?.method === 'POST') {
+        return Promise.resolve(fakeResponse(200, { status: 'running' }))
+      }
+
+      // After OOM, all fetches fail (server is gone)
+      if (statusCallCount >= oomAfterPolls) {
+        if (urlStr.includes('/status')) {
+          // Advance time to trigger heartbeat grace expiry
+          timeOffset += 25000
+          return Promise.reject(new Error('ECONNREFUSED'))
+        }
+        if (urlStr.includes('/heartbeat')) {
+          return Promise.reject(new Error('ECONNREFUSED'))
+        }
+        if (urlStr.includes('/logs')) {
+          return Promise.reject(new Error('ECONNREFUSED'))
+        }
+      }
+
+      if (urlStr.includes('/logs')) {
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/status')) {
+        statusCallCount++
+        return Promise.resolve(
+          fakeResponse(200, { status: 'running', exit_code: null })
+        )
+      }
+      if (urlStr.includes('/heartbeat')) {
+        return Promise.resolve(fakeResponse(200, { status: 'ok' }))
+      }
+      return Promise.reject(new Error(`Unexpected: ${urlStr}`))
+    })
+
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('OOMKilled')
+  })
+
+  it('should handle workflow pod sudden death with generic termination', async () => {
+    // Pod dies for a non-OOM reason (e.g., preemption, crash).
+    // All fetches fail, heartbeat times out, diagnostic shows terminated
+    // with reason: Error.
+    const realDateNow = Date.now
+    const startTime = realDateNow()
+    let timeOffset = 0
+
+    jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
+
+    mockGetPodByName.mockResolvedValue({
+      status: {
+        phase: 'Failed',
+        podIP: POD_IP,
+        containerStatuses: [
+          {
+            name: CONTAINER_NAME,
+            state: {
+              terminated: {
+                reason: 'Error',
+                exitCode: 1,
+                message: 'container exited unexpectedly'
+              }
+            }
+          }
+        ]
+      }
+    })
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/exec') && init?.method === 'POST') {
+        return Promise.resolve(fakeResponse(200, { status: 'running' }))
+      }
+      if (urlStr.includes('/logs')) {
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/status')) {
+        timeOffset += 61000
+        return Promise.resolve(
+          fakeResponse(200, { status: 'running', exit_code: null })
+        )
+      }
+      if (urlStr.includes('/heartbeat')) {
+        return Promise.reject(new Error('connection refused'))
+      }
+      return Promise.reject(new Error(`Unexpected: ${urlStr}`))
+    })
+
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('container exited unexpectedly')
+  })
 })
