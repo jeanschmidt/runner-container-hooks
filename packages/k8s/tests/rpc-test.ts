@@ -262,6 +262,8 @@ describe('rpcPodStep', () => {
   const PORT = 8080
   const SCRIPT_PATH = '/__w/_temp/run.sh'
   const TOKEN = 'test-token-abc'
+  const POD_NAME = 'test-pod'
+  const CONTAINER_NAME = 'job'
 
   let fetchMock: jest.Mock
   let stdoutWriteSpy: jest.SpyInstance
@@ -271,6 +273,11 @@ describe('rpcPodStep', () => {
     jest.clearAllMocks()
     fetchMock = jest.fn()
     global.fetch = fetchMock
+
+    // Default: getPodByName returns a pod in Unknown state (for diagnostics)
+    mockGetPodByName.mockResolvedValue({
+      status: { phase: 'Running', podIP: POD_IP }
+    })
 
     // Suppress actual stdout/stderr writes during tests
     stdoutWriteSpy = jest
@@ -326,7 +333,7 @@ describe('rpcPodStep', () => {
   it('should send POST /exec with correct body and auth token', async () => {
     setupSimpleExecFlow(0)
 
-    await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
 
     // Find the /exec call
     const execCall = fetchMock.mock.calls.find(
@@ -347,7 +354,14 @@ describe('rpcPodStep', () => {
   it('should poll /status until completed and return exit code 0', async () => {
     setupSimpleExecFlow(0, 'completed')
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(0)
   })
@@ -355,7 +369,14 @@ describe('rpcPodStep', () => {
   it('should return exit code on failure (non-zero)', async () => {
     setupSimpleExecFlow(1, 'failed')
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(1)
   })
@@ -363,7 +384,14 @@ describe('rpcPodStep', () => {
   it('should return exit code 137 for killed process', async () => {
     setupSimpleExecFlow(137, 'failed')
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(137)
   })
@@ -394,7 +422,14 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(-1)
   })
@@ -446,7 +481,7 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
 
     // Verify stdout was fetched with correct query params
     const stdoutCalls = fetchMock.mock.calls.filter(
@@ -507,7 +542,7 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
 
     const stderrCalls = fetchMock.mock.calls.filter(
       ([url]) => url.includes('/logs') && url.includes('stream=stderr')
@@ -579,7 +614,14 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(0)
     // stdout was written at least twice (chunk1 and chunk2)
@@ -589,7 +631,14 @@ describe('rpcPodStep', () => {
   it('should handle empty log responses', async () => {
     setupSimpleExecFlow(0)
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(0)
   })
@@ -601,9 +650,9 @@ describe('rpcPodStep', () => {
       .mockRejectedValueOnce(netErr)
       .mockRejectedValueOnce(netErr)
 
-    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
-      'RPC /exec network error after 3 attempts'
-    )
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('RPC /exec network error after 3 attempts')
   })
 
   it('should succeed if /exec network error recovers on retry', async () => {
@@ -636,7 +685,14 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(0)
   })
@@ -647,9 +703,9 @@ describe('rpcPodStep', () => {
       .mockResolvedValueOnce(fakeResponse(502, 'bad gateway'))
       .mockResolvedValueOnce(fakeResponse(503, 'service unavailable'))
 
-    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
-      'RPC /exec failed after 3 attempts'
-    )
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('RPC /exec failed after 3 attempts')
   })
 
   it('should succeed if /exec 5xx recovers on retry', async () => {
@@ -679,7 +735,14 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(0)
   })
@@ -687,9 +750,9 @@ describe('rpcPodStep', () => {
   it('should throw immediately on /exec 4xx without retry', async () => {
     fetchMock.mockResolvedValueOnce(fakeResponse(400, 'bad request'))
 
-    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
-      'RPC /exec failed (400)'
-    )
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('RPC /exec failed (400)')
 
     // Only one /exec call should have been made (no retries)
     const execCalls = fetchMock.mock.calls.filter(
@@ -701,9 +764,9 @@ describe('rpcPodStep', () => {
   it('should throw immediately on /exec 403', async () => {
     fetchMock.mockResolvedValueOnce(fakeResponse(403, 'forbidden'))
 
-    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
-      'RPC /exec failed (403)'
-    )
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('RPC /exec failed (403)')
   })
 
   it('should throw immediately on /exec 409', async () => {
@@ -711,9 +774,9 @@ describe('rpcPodStep', () => {
       fakeResponse(409, 'A job is already running')
     )
 
-    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
-      'RPC /exec failed (409)'
-    )
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('RPC /exec failed (409)')
   })
 
   it('should send heartbeats during execution', async () => {
@@ -762,7 +825,14 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    const promise = rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const promise = rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     // Advance fake clock in small steps to let both sleep and setInterval fire.
     // LOG_POLL_INTERVAL_MS = 200, HEARTBEAT_INTERVAL_MS = 3000
@@ -796,7 +866,14 @@ describe('rpcPodStep', () => {
 
     const clearIntervalSpy = jest.spyOn(global, 'clearInterval')
 
-    const promise = rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const promise = rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
     await jest.advanceTimersByTimeAsync(500)
     await promise
 
@@ -805,12 +882,28 @@ describe('rpcPodStep', () => {
     jest.useRealTimers()
   })
 
-  it('should throw on heartbeat timeout after 60s grace period', async () => {
+  it('should throw on heartbeat timeout with OOM diagnostic', async () => {
     const realDateNow = Date.now
     const startTime = realDateNow()
     let timeOffset = 0
 
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
+
+    // Pod shows OOMKilled container
+    mockGetPodByName.mockResolvedValue({
+      status: {
+        phase: 'Failed',
+        podIP: POD_IP,
+        containerStatuses: [
+          {
+            name: CONTAINER_NAME,
+            state: {
+              terminated: { reason: 'OOMKilled', exitCode: 137 }
+            }
+          }
+        ]
+      }
+    })
 
     fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
       const urlStr = url.toString()
@@ -823,22 +916,196 @@ describe('rpcPodStep', () => {
         )
       }
       if (urlStr.includes('/status')) {
-        // Advance time by 61 seconds — beyond the 60s heartbeat grace
         timeOffset += 61000
         return Promise.resolve(
           fakeResponse(200, { status: 'running', exit_code: null })
         )
       }
       if (urlStr.includes('/heartbeat')) {
-        // Heartbeat always fails
         return Promise.reject(new Error('connection refused'))
       }
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
-      'RPC heartbeat failed for 60s'
-    )
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('OOMKilled')
+  })
+
+  it('should throw on heartbeat timeout with eviction diagnostic', async () => {
+    const realDateNow = Date.now
+    const startTime = realDateNow()
+    let timeOffset = 0
+
+    jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
+
+    mockGetPodByName.mockResolvedValue({
+      status: {
+        phase: 'Failed',
+        reason: 'Evicted',
+        message: 'The node was low on resource: memory.',
+        podIP: POD_IP
+      }
+    })
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/exec') && init?.method === 'POST') {
+        return Promise.resolve(fakeResponse(200, { status: 'running' }))
+      }
+      if (urlStr.includes('/logs')) {
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/status')) {
+        timeOffset += 61000
+        return Promise.resolve(
+          fakeResponse(200, { status: 'running', exit_code: null })
+        )
+      }
+      if (urlStr.includes('/heartbeat')) {
+        return Promise.reject(new Error('connection refused'))
+      }
+      return Promise.reject(new Error(`Unexpected: ${urlStr}`))
+    })
+
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('Pod was evicted')
+  })
+
+  it('should throw on heartbeat timeout with node-failure diagnostic', async () => {
+    const realDateNow = Date.now
+    const startTime = realDateNow()
+    let timeOffset = 0
+
+    jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
+
+    mockGetPodByName.mockResolvedValue({
+      status: {
+        phase: 'Unknown',
+        message: 'Node lost contact',
+        podIP: POD_IP
+      }
+    })
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/exec') && init?.method === 'POST') {
+        return Promise.resolve(fakeResponse(200, { status: 'running' }))
+      }
+      if (urlStr.includes('/logs')) {
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/status')) {
+        timeOffset += 61000
+        return Promise.resolve(
+          fakeResponse(200, { status: 'running', exit_code: null })
+        )
+      }
+      if (urlStr.includes('/heartbeat')) {
+        return Promise.reject(new Error('connection refused'))
+      }
+      return Promise.reject(new Error(`Unexpected: ${urlStr}`))
+    })
+
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('possible node failure')
+  })
+
+  it('should fall back to generic message when diagnostics fail', async () => {
+    const realDateNow = Date.now
+    const startTime = realDateNow()
+    let timeOffset = 0
+
+    jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
+
+    // getPodByName throws — K8s API unreachable
+    mockGetPodByName.mockRejectedValue(new Error('API server unreachable'))
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/exec') && init?.method === 'POST') {
+        return Promise.resolve(fakeResponse(200, { status: 'running' }))
+      }
+      if (urlStr.includes('/logs')) {
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/status')) {
+        timeOffset += 61000
+        return Promise.resolve(
+          fakeResponse(200, { status: 'running', exit_code: null })
+        )
+      }
+      if (urlStr.includes('/heartbeat')) {
+        return Promise.reject(new Error('connection refused'))
+      }
+      return Promise.reject(new Error(`Unexpected: ${urlStr}`))
+    })
+
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('RPC heartbeat failed for 60s')
+  })
+
+  it('should detect RPC process death when container is still running', async () => {
+    const realDateNow = Date.now
+    const startTime = realDateNow()
+    let timeOffset = 0
+
+    jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
+
+    // Pod is still Running but RPC server died
+    mockGetPodByName.mockResolvedValue({
+      status: {
+        phase: 'Running',
+        podIP: POD_IP,
+        containerStatuses: [
+          {
+            name: CONTAINER_NAME,
+            state: { running: { startedAt: '2025-01-01T00:00:00Z' } }
+          }
+        ]
+      }
+    })
+
+    // execPodStepOutput returns the server log
+    mockExecPodStepOutput.mockResolvedValue({
+      exitCode: 0,
+      stdout: 'Killed'
+    })
+
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const urlStr = url.toString()
+      if (urlStr.includes('/exec') && init?.method === 'POST') {
+        return Promise.resolve(fakeResponse(200, { status: 'running' }))
+      }
+      if (urlStr.includes('/logs')) {
+        return Promise.resolve(
+          fakeResponse(200, null, { arrayBuffer: new ArrayBuffer(0) })
+        )
+      }
+      if (urlStr.includes('/status')) {
+        timeOffset += 61000
+        return Promise.resolve(
+          fakeResponse(200, { status: 'running', exit_code: null })
+        )
+      }
+      if (urlStr.includes('/heartbeat')) {
+        return Promise.reject(new Error('connection refused'))
+      }
+      return Promise.reject(new Error(`Unexpected: ${urlStr}`))
+    })
+
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('RPC server process died')
   })
 
   it('should handle /status fetch failures gracefully (retry)', async () => {
@@ -871,7 +1138,14 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(0)
     expect(statusCallCount).toBe(2)
@@ -912,7 +1186,14 @@ describe('rpcPodStep', () => {
     })
 
     // Should complete despite log fetch failures
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(0)
   })
@@ -961,7 +1242,14 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(0)
 
@@ -996,7 +1284,14 @@ describe('rpcPodStep', () => {
       return Promise.reject(new Error(`Unexpected: ${urlStr}`))
     })
 
-    const exitCode = await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    const exitCode = await rpcPodStep(
+      POD_IP,
+      PORT,
+      SCRIPT_PATH,
+      TOKEN,
+      POD_NAME,
+      CONTAINER_NAME
+    )
 
     expect(exitCode).toBe(0)
   })
@@ -1004,7 +1299,7 @@ describe('rpcPodStep', () => {
   it('should pass abort signal with timeout to fetch calls', async () => {
     setupSimpleExecFlow(0)
 
-    await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)
+    await rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
 
     // Verify all fetch calls include a signal
     for (const [, opts] of fetchMock.mock.calls) {
@@ -1019,9 +1314,9 @@ describe('rpcPodStep', () => {
       fakeResponse(422, 'Unprocessable: missing required field "id"')
     )
 
-    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
-      'RPC /exec failed (422)'
-    )
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('RPC /exec failed (422)')
   })
 
   it('should handle /exec response where text() throws', async () => {
@@ -1043,8 +1338,8 @@ describe('rpcPodStep', () => {
 
     fetchMock.mockResolvedValueOnce(badResp)
 
-    await expect(rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN)).rejects.toThrow(
-      'RPC /exec failed (400)'
-    )
+    await expect(
+      rpcPodStep(POD_IP, PORT, SCRIPT_PATH, TOKEN, POD_NAME, CONTAINER_NAME)
+    ).rejects.toThrow('RPC /exec failed (400)')
   })
 })

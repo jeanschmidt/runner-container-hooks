@@ -25,6 +25,8 @@ const FETCH_TIMEOUT_MS = 10000
 const PORT_FILE = '/tmp/rpc-server.port'
 const PORT_DISCOVER_TIMEOUT_MS = 5000
 const PORT_DISCOVER_POLL_MS = 200
+const DIAGNOSTIC_TIMEOUT_MS = 15000
+const DIAGNOSTIC_EXEC_TIMEOUT_MS = 10000
 
 function rpcUrl(podIp: string, port: number, path: string): string {
   return `http://${podIp}:${port}${path}`
@@ -174,11 +176,121 @@ export async function deployRpcServer(
   )
 }
 
+interface PodFailureDiagnostic {
+  cause:
+    | 'container-oom'
+    | 'pod-evicted'
+    | 'node-failure'
+    | 'rpc-process-died'
+    | 'unknown'
+  exitCode: number
+  message: string
+}
+
+async function diagnosePodFailure(
+  podName: string,
+  containerName: string
+): Promise<PodFailureDiagnostic> {
+  const pod = await getPodByName(podName)
+  const phase = pod.status?.phase
+  const podReason = pod.status?.reason
+  const podMessage = pod.status?.message
+
+  const containerStatus = pod.status?.containerStatuses?.find(
+    cs => cs.name === containerName
+  )
+
+  // Container terminated — check reason (OOMKilled, Error, etc.)
+  const terminated = containerStatus?.state?.terminated
+  if (terminated) {
+    if (terminated.reason === 'OOMKilled') {
+      // Force 137 — some CRI runtimes report exitCode 0 for OOMKilled
+      const oomExitCode = terminated.exitCode || 137
+      return {
+        cause: 'container-oom',
+        exitCode: oomExitCode,
+        message: `Container "${containerName}" was OOMKilled (exit code ${oomExitCode}). The process exceeded the container memory limit.`
+      }
+    }
+    return {
+      cause: 'unknown',
+      exitCode: terminated.exitCode ?? -1,
+      message: `Container "${containerName}" terminated: ${terminated.reason ?? 'unknown reason'} (exit code ${terminated.exitCode ?? -1})${terminated.message ? `. ${terminated.message}` : ''}`
+    }
+  }
+
+  // Pod-level failure (eviction, preemption, etc.)
+  if (phase === 'Failed') {
+    if (podReason === 'Evicted') {
+      return {
+        cause: 'pod-evicted',
+        exitCode: -1,
+        message: `Pod was evicted${podMessage ? `: ${podMessage}` : ''}`
+      }
+    }
+    return {
+      cause: 'unknown',
+      exitCode: -1,
+      message: `Pod failed: ${podReason ?? 'unknown reason'}${podMessage ? `. ${podMessage}` : ''}`
+    }
+  }
+
+  // Pod phase Unknown — typically node failure
+  if (phase === 'Unknown') {
+    return {
+      cause: 'node-failure',
+      exitCode: -1,
+      message: `Pod is in Unknown phase — possible node failure${podMessage ? `. ${podMessage}` : ''}`
+    }
+  }
+
+  // Container still running — RPC server process likely crashed inside it
+  if (phase === 'Running' && containerStatus?.state?.running) {
+    let serverLog = ''
+    try {
+      let execTimer: ReturnType<typeof setTimeout>
+      const result = await Promise.race([
+        execPodStepOutput(
+          [
+            'sh',
+            '-c',
+            'tail -20 /tmp/rpc-server.log 2>/dev/null || echo "(no server log)"'
+          ],
+          podName,
+          containerName
+        ),
+        new Promise<never>((_, reject) => {
+          execTimer = setTimeout(
+            () => reject(new Error('diagnostic exec timeout')),
+            DIAGNOSTIC_EXEC_TIMEOUT_MS
+          )
+        })
+      ]).finally(() => clearTimeout(execTimer))
+      serverLog = result.stdout
+    } catch {
+      // Diagnostic exec failed — proceed without server log
+    }
+    return {
+      cause: 'rpc-process-died',
+      exitCode: -1,
+      message: `RPC server process died while container is still running (likely process-level OOM or crash)${serverLog ? `\nServer log:\n${serverLog}` : ''}`
+    }
+  }
+
+  return {
+    cause: 'unknown',
+    exitCode: -1,
+    message: `Pod in unexpected state: phase=${phase}, reason=${podReason}${podMessage ? `. ${podMessage}` : ''}`
+  }
+}
+
 export async function rpcPodStep(
   podIp: string,
   port: number,
   scriptPath: string,
-  token: string
+  token: string,
+  podName: string,
+  containerName: string
 ): Promise<number> {
   const id = crypto.randomUUID()
   const headers = { 'X-Auth-Token': token, 'Content-Type': 'application/json' }
@@ -258,7 +370,26 @@ export async function rpcPodStep(
   try {
     while (true) {
       if (Date.now() - lastSuccessfulHeartbeat > HEARTBEAT_GRACE_MS) {
-        throw new Error('RPC heartbeat failed for 60s — infrastructure failure')
+        let diagnosticMsg =
+          'RPC heartbeat failed for 60s — infrastructure failure'
+        try {
+          let diagTimer: ReturnType<typeof setTimeout>
+          const diagnostic = await Promise.race([
+            diagnosePodFailure(podName, containerName),
+            new Promise<never>((_, reject) => {
+              diagTimer = setTimeout(
+                () => reject(new Error('diagnostic timed out')),
+                DIAGNOSTIC_TIMEOUT_MS
+              )
+            })
+          ]).finally(() => clearTimeout(diagTimer))
+          diagnosticMsg = diagnostic.message
+          core.error(`Step failed: ${diagnostic.message}`)
+        } catch (diagErr) {
+          core.debug(`Pod failure diagnosis failed: ${diagErr}`)
+          core.error(diagnosticMsg)
+        }
+        throw new Error(diagnosticMsg)
       }
 
       // Log streaming — stdout and stderr in parallel

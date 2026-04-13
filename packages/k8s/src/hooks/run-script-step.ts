@@ -98,7 +98,9 @@ export async function runScriptStep(
       state.rpcPodIp,
       state.rpcPort,
       containerPath,
-      state.rpcToken
+      state.rpcToken,
+      state.jobPod,
+      JOB_CONTAINER_NAME
     )
   } catch (err) {
     core.debug(`execPodStep failed: ${JSON.stringify(err)}`)
