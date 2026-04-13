@@ -5,11 +5,13 @@
 const MOCK_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 
 const mockExecPodStep = jest.fn()
+const mockExecPodStepOutput = jest.fn()
 const mockExecPodStepWithRetry = jest.fn()
 const mockGetPodByName = jest.fn()
 
 jest.mock('../src/k8s', () => ({
   execPodStep: (...args) => mockExecPodStep(...args),
+  execPodStepOutput: (...args) => mockExecPodStepOutput(...args),
   execPodStepWithRetry: (...args) => mockExecPodStepWithRetry(...args),
   getPodByName: (...args) => mockGetPodByName(...args)
 }))
@@ -79,11 +81,10 @@ function fakeResponse(
 // ---------------------------------------------------------------------------
 
 describe('deployRpcServer', () => {
+  const DISCOVERED_PORT = 45678
+
   beforeEach(() => {
     jest.clearAllMocks()
-
-    // Deterministic port for tests
-    jest.spyOn(Math, 'random').mockReturnValue(0.5) // port = floor(0.5 * 50000) + 10000 = 35000
 
     // Default: getPodByName returns a pod with an IP
     mockGetPodByName.mockResolvedValue({
@@ -95,6 +96,12 @@ describe('deployRpcServer', () => {
 
     // Default: health check succeeds (execPodStep returns 0)
     mockExecPodStep.mockResolvedValue(0)
+
+    // Default: port discovery returns a port
+    mockExecPodStepOutput.mockResolvedValue({
+      exitCode: 0,
+      stdout: String(DISCOVERED_PORT)
+    })
   })
 
   afterEach(() => {
@@ -145,79 +152,71 @@ describe('deployRpcServer', () => {
     expect(writeCall[3]).toBe('write rpc server')
   })
 
-  it('should start the server with correct --port and --token args', async () => {
+  it('should start the server with --port 0 and correct --token args', async () => {
     await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
     // Third exec call: start rpc server
     const startCall = mockExecPodStepWithRetry.mock.calls[2]
     expect(startCall[0][0]).toBe('sh')
     expect(startCall[0][1]).toBe('-c')
-    expect(startCall[0][2]).toContain('--port 35000')
+    expect(startCall[0][2]).toContain('--port 0')
     expect(startCall[0][2]).toContain('--token tok-123')
     expect(startCall[0][2]).toContain('nohup python3 /tmp/rpc-server.py')
     expect(startCall[3]).toBe('start rpc server')
   })
 
   it('should poll health until server is ready and return podIp and port', async () => {
-    // First health check fails, second succeeds
-    mockExecPodStep.mockResolvedValueOnce(1).mockResolvedValueOnce(0)
+    // rm -f succeeds (port file cleanup), then first health check fails, second succeeds
+    mockExecPodStep
+      .mockResolvedValueOnce(0)
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(0)
 
     const result = await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
-    expect(result).toEqual({ podIp: '10.0.0.1', port: 35000 })
-    // execPodStep was called at least twice for health checks
-    expect(mockExecPodStep.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(result).toEqual({ podIp: '10.0.0.1', port: DISCOVERED_PORT })
   })
 
   it('should return on first health check success', async () => {
     const result = await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
-    expect(result).toEqual({ podIp: '10.0.0.1', port: 35000 })
+    expect(result).toEqual({ podIp: '10.0.0.1', port: DISCOVERED_PORT })
   })
 
-  it('should retry with new random port if health check times out', async () => {
+  it('should retry if port discovery fails on first attempt', async () => {
+    const SECOND_PORT = 55555
+    let portDiscoveryCallCount = 0
+
     const realDateNow = Date.now
     const startTime = realDateNow()
-
-    // Math.random is called once per port attempt inside the for-loop.
-    // First attempt -> 0.5 -> port 35000, second attempt -> 0.2 -> port 20000
-    let randomCallCount = 0
-    jest.spyOn(Math, 'random').mockImplementation(() => {
-      randomCallCount++
-      return randomCallCount === 1 ? 0.5 : 0.2
-    })
-
-    // Mock Date.now: each call during the health-poll while-loop advances time.
-    // We need the first port attempt to exceed HEALTH_TIMEOUT_MS (30s) so the
-    // loop exits and tries the next port.
     let timeOffset = 0
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
 
-    mockExecPodStep.mockImplementation(async (cmd: string[]) => {
-      const cmdStr = cmd[2] || ''
-      if (cmdStr.includes(':35000')) {
-        // First port: fail and advance time beyond 30s timeout
-        timeOffset += 31000
-        return 1
+    // First port discovery poll: fail and advance time past timeout
+    // Subsequent polls: succeed with a port
+    mockExecPodStepOutput.mockImplementation(async () => {
+      portDiscoveryCallCount++
+      if (portDiscoveryCallCount <= 1) {
+        timeOffset += 6000
+        return { exitCode: 1, stdout: '' }
       }
-      // Second port (20000): succeed immediately
-      return 0
+      return { exitCode: 0, stdout: String(SECOND_PORT) }
     })
 
     const result = await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
     expect(result.podIp).toBe('10.0.0.1')
-    expect(result.port).toBe(20000)
-    // The server was started on two different ports
+    expect(result.port).toBe(SECOND_PORT)
+    // The server was started twice (both with --port 0)
     const startCalls = mockExecPodStepWithRetry.mock.calls.filter(
       c => c[3] === 'start rpc server'
     )
     expect(startCalls.length).toBe(2)
-    expect(startCalls[0][0][2]).toContain('--port 35000')
-    expect(startCalls[1][0][2]).toContain('--port 20000')
+    expect(startCalls[0][0][2]).toContain('--port 0')
+    expect(startCalls[1][0][2]).toContain('--port 0')
   })
 
-  it('should throw after max port attempts exhausted', async () => {
+  it('should throw after max deploy attempts exhausted', async () => {
     const realDateNow = Date.now
     const startTime = realDateNow()
     let timeOffset = 0
@@ -233,7 +232,7 @@ describe('deployRpcServer', () => {
     await expect(
       deployRpcServer('my-pod', 'my-container', 'tok-123')
     ).rejects.toThrow(
-      'RPC server failed to become healthy after 3 port attempts'
+      'RPC server failed to become healthy after 3 attempts'
     )
   })
 
@@ -244,7 +243,12 @@ describe('deployRpcServer', () => {
 
     jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
 
-    mockExecPodStep.mockImplementation(async () => {
+    mockExecPodStep.mockImplementation(async (cmd: string[]) => {
+      const cmdStr = cmd[2] || ''
+      if (cmdStr.includes('rm -f')) {
+        return 0
+      }
+      // Health check calls throw network error
       timeOffset += 31000
       throw new Error('exec failed')
     })
@@ -252,7 +256,7 @@ describe('deployRpcServer', () => {
     await expect(
       deployRpcServer('my-pod', 'my-container', 'tok-123')
     ).rejects.toThrow(
-      'RPC server failed to become healthy after 3 port attempts'
+      'RPC server failed to become healthy after 3 attempts'
     )
   })
 })

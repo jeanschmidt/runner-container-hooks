@@ -1,7 +1,12 @@
 import * as core from '@actions/core'
 import * as crypto from 'crypto'
 import { sleep } from './utils'
-import { execPodStep, execPodStepWithRetry, getPodByName } from './index'
+import {
+  execPodStep,
+  execPodStepOutput,
+  execPodStepWithRetry,
+  getPodByName
+} from './index'
 import { RPC_SERVER_SCRIPT } from './rpc-server-script'
 
 interface RpcStatusResponse {
@@ -13,10 +18,13 @@ interface RpcStatusResponse {
 const HEALTH_POLL_INTERVAL_MS = 1000
 const HEALTH_TIMEOUT_MS = 30000
 const HEARTBEAT_INTERVAL_MS = 3000
-const MAX_PORT_ATTEMPTS = 3
+const MAX_DEPLOY_ATTEMPTS = 3
 const HEARTBEAT_GRACE_MS = 60000
 const LOG_POLL_INTERVAL_MS = 200
 const FETCH_TIMEOUT_MS = 10000
+const PORT_FILE = '/tmp/rpc-server.port'
+const PORT_DISCOVER_TIMEOUT_MS = 5000
+const PORT_DISCOVER_POLL_MS = 200
 
 function rpcUrl(podIp: string, port: number, path: string): string {
   return `http://${podIp}:${port}${path}`
@@ -43,8 +51,31 @@ async function healthCheck(
   }
 }
 
-function randomPort(): number {
-  return Math.floor(Math.random() * 50000) + 10000
+async function discoverPort(
+  podName: string,
+  containerName: string
+): Promise<number | null> {
+  const startTime = Date.now()
+  while (Date.now() - startTime < PORT_DISCOVER_TIMEOUT_MS) {
+    try {
+      const { exitCode, stdout } = await execPodStepOutput(
+        ['cat', PORT_FILE],
+        podName,
+        containerName
+      )
+      if (exitCode === 0 && stdout) {
+        const port = parseInt(stdout, 10)
+        if (!isNaN(port) && port > 0) {
+          core.debug(`Discovered RPC server port: ${port}`)
+          return port
+        }
+      }
+    } catch {
+      // Port file may not exist yet, keep polling
+    }
+    await sleep(PORT_DISCOVER_POLL_MS)
+  }
+  return null
 }
 
 export async function deployRpcServer(
@@ -81,22 +112,38 @@ export async function deployRpcServer(
     'write rpc server'
   )
 
-  for (let attempt = 1; attempt <= MAX_PORT_ATTEMPTS; attempt++) {
-    const port = randomPort()
+  for (let attempt = 1; attempt <= MAX_DEPLOY_ATTEMPTS; attempt++) {
     core.debug(
-      `Starting RPC server on port ${port} (attempt ${attempt}/${MAX_PORT_ATTEMPTS})`
+      `Starting RPC server (attempt ${attempt}/${MAX_DEPLOY_ATTEMPTS})`
     )
 
+    // Kill any server from a previous failed attempt and clean up port file
+    await execPodStep(
+      ['sh', '-c', `pkill -f 'python3 /tmp/rpc-server.py' 2>/dev/null; rm -f ${PORT_FILE}`],
+      podName,
+      containerName
+    )
+
+    // Start server with port 0 — OS assigns a free port
     await execPodStepWithRetry(
       [
         'sh',
         '-c',
-        `nohup python3 /tmp/rpc-server.py --port ${port} --token ${token} > /tmp/rpc-server.log 2>&1 & echo $!`
+        `nohup python3 /tmp/rpc-server.py --port 0 --token ${token} > /tmp/rpc-server.log 2>&1 & echo $!`
       ],
       podName,
       containerName,
       'start rpc server'
     )
+
+    // Discover the actual port assigned by the OS
+    const port = await discoverPort(podName, containerName)
+    if (port === null) {
+      core.debug(
+        `Failed to discover RPC server port, attempt ${attempt}/${MAX_DEPLOY_ATTEMPTS}`
+      )
+      continue
+    }
 
     const startTime = Date.now()
     let healthy = false
@@ -114,12 +161,12 @@ export async function deployRpcServer(
     }
 
     core.debug(
-      `RPC server failed health check on port ${port}, attempt ${attempt}/${MAX_PORT_ATTEMPTS}`
+      `RPC server failed health check on port ${port}, attempt ${attempt}/${MAX_DEPLOY_ATTEMPTS}`
     )
   }
 
   throw new Error(
-    `RPC server failed to become healthy after ${MAX_PORT_ATTEMPTS} port attempts`
+    `RPC server failed to become healthy after ${MAX_DEPLOY_ATTEMPTS} attempts`
   )
 }
 

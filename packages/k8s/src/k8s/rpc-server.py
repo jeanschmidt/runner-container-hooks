@@ -11,6 +11,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG_DIR = "/tmp/rpc-logs"
+PORT_FILE = "/tmp/rpc-server.port"
 MAX_CHUNK = 1048576  # 1 MB
 
 _lock = threading.Lock()
@@ -290,7 +291,14 @@ def main():
     watchdog.start()
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"RPC server listening on 0.0.0.0:{args.port}")
+    actual_port = server.server_address[1]
+
+    # Write the actual bound port so the deployer can discover it.
+    # This is written AFTER bind+listen so the port is guaranteed usable.
+    with open(PORT_FILE, "w") as f:
+        f.write(str(actual_port))
+
+    print(f"RPC server listening on 0.0.0.0:{actual_port}")
     server.serve_forever()
 
 

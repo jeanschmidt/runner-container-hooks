@@ -513,6 +513,78 @@ export async function execPodStep(
   })
 }
 
+export async function execPodStepOutput(
+  command: string[],
+  podName: string,
+  containerName: string
+): Promise<{ exitCode: number; stdout: string }> {
+  const exec = new k8s.Exec(kc)
+  const stdoutBuffer = new WritableStreamBuffer()
+
+  command = fixArgs(command)
+  return new Promise(function (resolve, reject) {
+    let settled = false
+    exec
+      .exec(
+        namespace(),
+        podName,
+        containerName,
+        command,
+        stdoutBuffer,
+        process.stderr,
+        null,
+        false /* tty */,
+        resp => {
+          settled = true
+          const stdout = (
+            stdoutBuffer.getContentsAsString('utf8') || ''
+          ).trim()
+          if (resp.status === 'Success') {
+            resolve({ exitCode: 0, stdout })
+          } else {
+            const exitCode = extractExitCode(resp)
+            if (exitCode !== null) {
+              resolve({ exitCode, stdout })
+            } else {
+              reject(new Error(resp?.message || 'execPodStepOutput failed'))
+            }
+          }
+        }
+      )
+      .then(ws => {
+        if (ws) {
+          ws.on('close', () => {
+            if (!settled) {
+              settled = true
+              const stdout = (
+                stdoutBuffer.getContentsAsString('utf8') || ''
+              ).trim()
+              resolve({ exitCode: 1, stdout })
+            }
+          })
+          ws.on('error', (err: Error) => {
+            if (!settled) {
+              settled = true
+              core.warning(
+                `execPodStepOutput: WebSocket error: ${err.message}`
+              )
+              const stdout = (
+                stdoutBuffer.getContentsAsString('utf8') || ''
+              ).trim()
+              resolve({ exitCode: 1, stdout })
+            }
+          })
+        }
+      })
+      .catch(e => {
+        if (!settled) {
+          settled = true
+          reject(e)
+        }
+      })
+  })
+}
+
 export async function execCalculateOutputHashSorted(
   podName: string,
   containerName: string,
