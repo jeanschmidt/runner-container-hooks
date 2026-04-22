@@ -1,5 +1,3 @@
-import { WritableStreamBuffer } from 'stream-buffers'
-
 const mockExec = jest.fn()
 const mockReadNamespacedPod = jest.fn()
 const mockReadNamespacedJob = jest.fn()
@@ -89,9 +87,9 @@ describe('error serialization', () => {
 
       await expect(
         execCpToPod('test-pod', '/tmp/src', '/workspace')
-      ).rejects.toThrow(
-        expect.not.objectContaining({ message: expect.stringContaining('{}') })
-      )
+      ).rejects.toMatchObject({
+        message: expect.not.stringContaining('{}')
+      })
     })
   })
 
