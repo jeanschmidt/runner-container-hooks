@@ -6,6 +6,9 @@ import {
   mergePodSpecWithOptions,
   mergeContainerWithOptions,
   readExtensionFromFile,
+  injectSameNodePreference,
+  useSameNodePreference,
+  ENV_SAME_NODE_PREFERENCE,
   ENV_HOOK_TEMPLATE_PATH
 } from '../src/k8s/utils'
 import * as k8s from '@kubernetes/client-node'
@@ -337,6 +340,123 @@ spec:
     expectJobContainer.name = base.name
     mergeContainerWithOptions(base, from)
     expect(base).toStrictEqual(expectContainer)
+  })
+
+  describe('useSameNodePreference', () => {
+    const originalEnv = process.env
+
+    afterEach(() => {
+      process.env = originalEnv
+    })
+
+    it('should return false when env var is not set', () => {
+      delete process.env[ENV_SAME_NODE_PREFERENCE]
+      expect(useSameNodePreference()).toBe(false)
+    })
+
+    it('should return false when env var is empty', () => {
+      process.env[ENV_SAME_NODE_PREFERENCE] = ''
+      expect(useSameNodePreference()).toBe(false)
+    })
+
+    it('should return false when env var is not "true"', () => {
+      process.env[ENV_SAME_NODE_PREFERENCE] = 'false'
+      expect(useSameNodePreference()).toBe(false)
+
+      process.env[ENV_SAME_NODE_PREFERENCE] = 'TRUE'
+      expect(useSameNodePreference()).toBe(false)
+
+      process.env[ENV_SAME_NODE_PREFERENCE] = '1'
+      expect(useSameNodePreference()).toBe(false)
+    })
+
+    it('should return true when env var is "true"', () => {
+      process.env[ENV_SAME_NODE_PREFERENCE] = 'true'
+      expect(useSameNodePreference()).toBe(true)
+    })
+  })
+
+  describe('injectSameNodePreference', () => {
+    it('should add nodeAffinity to empty spec', () => {
+      const spec = { containers: [] } as k8s.V1PodSpec
+      injectSameNodePreference(spec, 'node-1')
+
+      const preferred =
+        spec.affinity?.nodeAffinity
+          ?.preferredDuringSchedulingIgnoredDuringExecution
+      expect(preferred).toHaveLength(1)
+      expect(preferred![0].weight).toBe(100)
+      expect(
+        preferred![0].preference.matchExpressions![0]
+      ).toStrictEqual({
+        key: 'kubernetes.io/hostname',
+        operator: 'In',
+        values: ['node-1']
+      })
+    })
+
+    it('should append to existing preferred scheduling entries', () => {
+      const spec = {
+        containers: [],
+        affinity: {
+          nodeAffinity: {
+            preferredDuringSchedulingIgnoredDuringExecution: [
+              {
+                weight: 50,
+                preference: {
+                  matchExpressions: [
+                    {
+                      key: 'node.kubernetes.io/instance-type',
+                      operator: 'In',
+                      values: ['m5.xlarge']
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      } as k8s.V1PodSpec
+
+      injectSameNodePreference(spec, 'node-2')
+
+      const preferred =
+        spec.affinity!.nodeAffinity!
+          .preferredDuringSchedulingIgnoredDuringExecution!
+      expect(preferred).toHaveLength(2)
+      expect(preferred[0].weight).toBe(50)
+      expect(preferred[1].weight).toBe(100)
+      expect(
+        preferred[1].preference.matchExpressions![0].values
+      ).toStrictEqual(['node-2'])
+    })
+
+    it('should not touch requiredDuringScheduling', () => {
+      const required = {
+        nodeSelectorTerms: [
+          {
+            matchExpressions: [
+              { key: 'zone', operator: 'In', values: ['us-east-1a'] }
+            ]
+          }
+        ]
+      }
+      const spec = {
+        containers: [],
+        affinity: {
+          nodeAffinity: {
+            requiredDuringSchedulingIgnoredDuringExecution: required
+          }
+        }
+      } as k8s.V1PodSpec
+
+      injectSameNodePreference(spec, 'node-3')
+
+      expect(
+        spec.affinity!.nodeAffinity!
+          .requiredDuringSchedulingIgnoredDuringExecution
+      ).toStrictEqual(required)
+    })
   })
 
   it('should merge pod spec', () => {

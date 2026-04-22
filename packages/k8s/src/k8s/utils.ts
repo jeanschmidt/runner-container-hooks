@@ -12,6 +12,7 @@ export const DEFAULT_CONTAINER_ENTRY_POINT = 'tail'
 
 export const ENV_HOOK_TEMPLATE_PATH = 'ACTIONS_RUNNER_CONTAINER_HOOK_TEMPLATE'
 export const ENV_USE_KUBE_SCHEDULER = 'ACTIONS_RUNNER_USE_KUBE_SCHEDULER'
+export const ENV_SAME_NODE_PREFERENCE = 'ACTIONS_RUNNER_SAME_NODE_PREFERENCE'
 
 export const EXTERNALS_VOLUME_NAME = 'externals'
 export const GITHUB_VOLUME_NAME = 'github'
@@ -267,6 +268,42 @@ export function readExtensionFromFile(): k8s.V1PodTemplateSpec | undefined {
 
 export function useKubeScheduler(): boolean {
   return process.env[ENV_USE_KUBE_SCHEDULER] === 'true'
+}
+
+export function useSameNodePreference(): boolean {
+  return process.env[ENV_SAME_NODE_PREFERENCE] === 'true'
+}
+
+export function injectSameNodePreference(
+  spec: k8s.V1PodSpec,
+  nodeName: string
+): void {
+  if (!spec.affinity) {
+    spec.affinity = {}
+  }
+  if (!spec.affinity.nodeAffinity) {
+    spec.affinity.nodeAffinity = {}
+  }
+  if (
+    !spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution
+  ) {
+    spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution =
+      []
+  }
+  spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution.push(
+    {
+      weight: 100,
+      preference: {
+        matchExpressions: [
+          {
+            key: 'kubernetes.io/hostname',
+            operator: 'In',
+            values: [nodeName]
+          }
+        ]
+      }
+    }
+  )
 }
 
 export enum PodPhase {
