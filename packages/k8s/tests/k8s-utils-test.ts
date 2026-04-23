@@ -343,10 +343,18 @@ spec:
   })
 
   describe('useSameNodePreference', () => {
-    const originalEnv = process.env
+    let savedValue: string | undefined
+
+    beforeEach(() => {
+      savedValue = process.env[ENV_SAME_NODE_PREFERENCE]
+    })
 
     afterEach(() => {
-      process.env = originalEnv
+      if (savedValue === undefined) {
+        delete process.env[ENV_SAME_NODE_PREFERENCE]
+      } else {
+        process.env[ENV_SAME_NODE_PREFERENCE] = savedValue
+      }
     })
 
     it('should return false when env var is not set', () => {

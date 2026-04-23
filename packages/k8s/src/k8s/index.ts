@@ -44,6 +44,9 @@ async function applySameNodePreference(spec: k8s.V1PodSpec): Promise<void> {
   try {
     const runnerPodName = process.env.ACTIONS_RUNNER_POD_NAME
     if (!runnerPodName) {
+      core.warning(
+        'Same-node scheduling preference is enabled but ACTIONS_RUNNER_POD_NAME is not set'
+      )
       return
     }
     const runnerPod = await k8sApi.readNamespacedPod({

@@ -3,7 +3,11 @@ import * as path from 'path'
 import { cleanupJob } from '../src/hooks'
 import { createContainerSpec, prepareJob } from '../src/hooks/prepare-job'
 import { TestHelper } from './test-setup'
-import { ENV_HOOK_TEMPLATE_PATH, generateContainerName } from '../src/k8s/utils'
+import {
+  ENV_HOOK_TEMPLATE_PATH,
+  ENV_SAME_NODE_PREFERENCE,
+  generateContainerName
+} from '../src/k8s/utils'
 import { execPodStep, getPodByName } from '../src/k8s'
 import { V1Container } from '@kubernetes/client-node'
 import { JOB_CONTAINER_NAME } from '../src/hooks/constants'
@@ -241,6 +245,50 @@ describe('Prepare job', () => {
     expect(content.state.jobPod).toBeTruthy()
     expect(content.context.container.image).toBe(
       'ghcr.io/actions/actions-runner:latest'
+    )
+  })
+
+  it('should apply same-node scheduling preference when enabled', async () => {
+    process.env[ENV_SAME_NODE_PREFERENCE] = 'true'
+
+    const runnerPodName = process.env.ACTIONS_RUNNER_POD_NAME!
+    let runnerNodeName: string | undefined
+    for (let i = 0; i < 30; i++) {
+      const runnerPod = await getPodByName(runnerPodName)
+      runnerNodeName = runnerPod.spec?.nodeName
+      if (runnerNodeName) break
+      await new Promise(r => setTimeout(r, 1000))
+    }
+    expect(runnerNodeName).toBeTruthy()
+
+    await prepareJob(prepareJobData.args, prepareJobOutputFilePath)
+
+    delete process.env[ENV_SAME_NODE_PREFERENCE]
+
+    const content = JSON.parse(
+      fs.readFileSync(prepareJobOutputFilePath).toString()
+    )
+
+    const got = await getPodByName(content.state.jobPod)
+    const preferred =
+      got.spec?.affinity?.nodeAffinity
+        ?.preferredDuringSchedulingIgnoredDuringExecution
+    expect(preferred).toBeDefined()
+    expect(preferred).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          weight: 100,
+          preference: {
+            matchExpressions: [
+              {
+                key: 'kubernetes.io/hostname',
+                operator: 'In',
+                values: [runnerNodeName]
+              }
+            ]
+          }
+        })
+      ])
     )
   })
 })
