@@ -108,29 +108,27 @@ describe('deployRpcServer', () => {
     }
     const cfg = { ...defaults, ...overrides }
 
-    mockExecPodStepOutputWithRetry.mockImplementation(
-      async (cmd: string[]) => {
-        const cmdStr = cmd.join(' ')
-        let result: StepResult | Error
-        if (cmdStr.includes('python3') && cmdStr.includes('--version')) {
-          result = cfg.python3
-        } else if (
-          cmdStr.includes('base64 -d') &&
-          cmdStr.includes('rpc-server.py')
-        ) {
-          result = cfg.write
-        } else if (
-          cmdStr.includes('nohup python3') &&
-          cmdStr.includes('rpc-server.py')
-        ) {
-          result = cfg.start
-        } else {
-          result = cfg.start
-        }
-        if (result instanceof Error) throw result
-        return result
+    mockExecPodStepOutputWithRetry.mockImplementation(async (cmd: string[]) => {
+      const cmdStr = cmd.join(' ')
+      let result: StepResult | Error
+      if (cmdStr.includes('python3') && cmdStr.includes('--version')) {
+        result = cfg.python3
+      } else if (
+        cmdStr.includes('base64 -d') &&
+        cmdStr.includes('rpc-server.py')
+      ) {
+        result = cfg.write
+      } else if (
+        cmdStr.includes('nohup python3') &&
+        cmdStr.includes('rpc-server.py')
+      ) {
+        result = cfg.start
+      } else {
+        result = cfg.start
       }
-    )
+      if (result instanceof Error) throw result
+      return result
+    })
 
     mockExecPodStepOutput.mockImplementation(async (cmd: string[]) => {
       const cmdStr = cmd.join(' ')
@@ -242,28 +240,26 @@ describe('deployRpcServer', () => {
 
   it('should continue to next attempt if server start fails', async () => {
     let startCallCount = 0
-    mockExecPodStepOutputWithRetry.mockImplementation(
-      async (cmd: string[]) => {
-        const cmdStr = cmd.join(' ')
-        if (cmdStr.includes('python3') && cmdStr.includes('--version')) {
-          return { exitCode: 0, stdout: 'Python 3.10.0' }
-        }
-        if (cmdStr.includes('base64 -d')) {
-          return { exitCode: 0, stdout: '' }
-        }
-        if (
-          cmdStr.includes('nohup python3') &&
-          cmdStr.includes('rpc-server.py')
-        ) {
-          startCallCount++
-          if (startCallCount === 1) {
-            throw new Error('start rpc server failed after 6 attempts')
-          }
-          return { exitCode: 0, stdout: '12345' }
-        }
+    mockExecPodStepOutputWithRetry.mockImplementation(async (cmd: string[]) => {
+      const cmdStr = cmd.join(' ')
+      if (cmdStr.includes('python3') && cmdStr.includes('--version')) {
+        return { exitCode: 0, stdout: 'Python 3.10.0' }
+      }
+      if (cmdStr.includes('base64 -d')) {
         return { exitCode: 0, stdout: '' }
       }
-    )
+      if (
+        cmdStr.includes('nohup python3') &&
+        cmdStr.includes('rpc-server.py')
+      ) {
+        startCallCount++
+        if (startCallCount === 1) {
+          throw new Error('start rpc server failed after 6 attempts')
+        }
+        return { exitCode: 0, stdout: '12345' }
+      }
+      return { exitCode: 0, stdout: '' }
+    })
 
     const result = await deployRpcServer('my-pod', 'my-container', 'tok-123')
     expect(result.port).toBe(DISCOVERED_PORT)
@@ -401,9 +397,7 @@ describe('deployRpcServer', () => {
 
   it('should include details in script write error message', async () => {
     setupDefaultMocks({
-      write: new Error(
-        'non-zero exit code 1 (stdout: Read-only file system)'
-      )
+      write: new Error('non-zero exit code 1 (stdout: Read-only file system)')
     })
 
     await expect(
