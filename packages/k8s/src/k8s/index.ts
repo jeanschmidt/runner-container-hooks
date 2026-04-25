@@ -922,6 +922,7 @@ export async function execCpFromPod(
       const errStream = new WritableStreamBuffer()
       let wsRef: WebSocket | null = null
       let execTimer: ReturnType<typeof setTimeout>
+      let execSucceeded = false
       try {
         await Promise.race([
           new Promise((resolve, reject) => {
@@ -987,16 +988,19 @@ export async function execCpFromPod(
             }, EXEC_TIMEOUT_MS)
           })
         ])
+        execSucceeded = true
       } finally {
         clearTimeout(execTimer!)
-        if (wsRef) {
-          try {
-            ;(wsRef as WebSocket).close()
-          } catch {
-            // already closed
+        if (!execSucceeded) {
+          if (wsRef) {
+            try {
+              ;(wsRef as WebSocket).close()
+            } catch {
+              // already closed
+            }
           }
+          writerStream.destroy()
         }
-        writerStream.destroy()
       }
 
       // Wait for the tar extraction stream to finish writing all data
@@ -1026,6 +1030,14 @@ export async function execCpFromPod(
             done(new Error('tar extract stream drain timed out after 90s'))
           }, 90000)
         })
+      }
+
+      if (wsRef) {
+        try {
+          ;(wsRef as WebSocket).close()
+        } catch {
+          // already closed
+        }
       }
 
       break
