@@ -476,7 +476,7 @@ export async function execPodStepOutputWithRetry(
     if (attempt < maxAttempts) {
       const delay = initialDelayMs * Math.pow(3, attempt - 1)
       core.debug(
-        `execPodStepOutputWithRetry(${description}): attempt ${attempt}/${maxAttempts} failed (${lastError!.message}), retrying in ${delay}ms`
+        `execPodStepOutputWithRetry(${description}): attempt ${attempt}/${maxAttempts} failed (${lastError?.message}), retrying in ${delay}ms`
       )
       await sleep(delay)
     }
