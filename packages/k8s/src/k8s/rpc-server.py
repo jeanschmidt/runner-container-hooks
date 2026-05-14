@@ -138,6 +138,10 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_exec()
             return
 
+        if path == "/kill":
+            self._handle_kill()
+            return
+
         if not _check_auth(self):
             return
 
@@ -196,6 +200,25 @@ class Handler(BaseHTTPRequestHandler):
             target=_wait_for_process, args=(proc, job_id), daemon=True,
         ).start()
         _send_json(self, {"id": job_id, "status": "running"})
+
+    def _handle_kill(self):
+        # /kill terminates the currently running job and is idempotent: if no
+        # job is in flight it returns the current state without error. This
+        # is the GHA cancellation forwarding path — the hook calls /kill from
+        # its SIGTERM/SIGINT handler so the in-pod subprocess exits and the
+        # next exec doesn't see "A job is already running".
+        token = self.headers.get("X-Auth-Token")
+        if token != _auth_token:
+            self.send_error(403, "Invalid auth token")
+            return
+        _kill_process()
+        with _lock:
+            data = {
+                "id": _job_id,
+                "status": _job_status,
+                "exit_code": _exit_code,
+            }
+        _send_json(self, data)
 
     def _send_bytes(self, data, more_data=False):
         self.send_response(200)
