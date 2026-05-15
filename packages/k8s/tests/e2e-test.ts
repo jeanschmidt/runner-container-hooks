@@ -5,6 +5,7 @@ import {
   runContainerStep,
   runScriptStep
 } from '../src/hooks'
+import { killRpcJob } from '../src/k8s/rpc'
 import { TestHelper } from './test-setup'
 import { RunContainerStepArgs, RunScriptStepArgs } from 'hooklib'
 
@@ -49,6 +50,83 @@ describe('e2e', () => {
     await expect(
       runContainerStep(runContainerStepData.args as RunContainerStepArgs)
     ).resolves.not.toThrow()
+
+    await expect(cleanupJob()).resolves.not.toThrow()
+  })
+
+  // Regression test for the cancellation-forwarding behaviour.
+  //
+  // Without /kill in place, a runScriptStep that's killed mid-run (e.g. GHA
+  // fail-fast cancellation) would leave the workflow pod's subprocess
+  // running, and every subsequent /exec would 409 with
+  // "A job is already running" until the heartbeat watchdog killed it 60s
+  // later. With /kill in place, calling killRpcJob from the cleanup callback
+  // resets the in-pod state immediately and the next runScriptStep proceeds.
+  //
+  // This test exercises the runtime contract end-to-end in a real kind pod:
+  // start a long-sleeping script, kill it via the public killRpcJob entry,
+  // confirm the runScriptStep returns with a non-zero exit code, then run a
+  // second runScriptStep against the same pod/RPC server and confirm it
+  // succeeds.
+  it('killRpcJob cancels an in-flight runScriptStep and lets a follow-up step succeed', async () => {
+    jest.setTimeout(120000)
+
+    await expect(
+      prepareJob(prepareJobData.args, prepareJobOutputFilePath)
+    ).resolves.not.toThrow()
+
+    const prepareJobOutputData = JSON.parse(
+      fs.readFileSync(prepareJobOutputFilePath).toString()
+    )
+    const state = prepareJobOutputData.state as {
+      jobPod: string
+      rpcPodIp: string
+      rpcPort: number
+      rpcToken: string
+    }
+    expect(state.rpcPodIp).toBeTruthy()
+    expect(state.rpcPort).toBeGreaterThan(0)
+    expect(state.rpcToken).toBeTruthy()
+
+    // Build a long-sleeping step. /bin/sleep is the binary so the runScript
+    // wrapper passes "30" verbatim — no shell-quoting pitfalls.
+    const longSleepArgs = {
+      ...testHelper.getRunScriptStepDefinition().args,
+      entryPoint: '/bin/sleep',
+      entryPointArgs: ['30']
+    } as RunScriptStepArgs
+
+    // Kick off the sleep in the background. We don't await yet — instead
+    // we race a kill against it after a short delay.
+    const sleepPromise = runScriptStep(longSleepArgs, state).catch(
+      (e: unknown) => e
+    )
+
+    // Give the wrapper enough time to /exec the sleep on the workflow pod
+    // (mkdir + cp + exec round-trip is typically <2s in kind).
+    await new Promise(r => setTimeout(r, 4000))
+
+    await killRpcJob(state.rpcPodIp, state.rpcPort, state.rpcToken)
+
+    const result = await sleepPromise
+
+    // runScriptStep either resolves with a non-zero exit code (if the
+    // wrapper saw the subprocess exit cleanly with the kill signal) or
+    // rejects with an error message (if the polling loop noticed the
+    // status became 'failed' between iterations). Both are acceptable —
+    // what matters is that it did NOT return 0 and the pod state is clean.
+    if (typeof result === 'number') {
+      expect(result).not.toBe(0)
+    } else {
+      // It's an Error from the throw in run-script-step.ts catch block.
+      expect(result).toBeInstanceOf(Error)
+    }
+
+    // The point of the patch: a second runScriptStep against the same pod
+    // must succeed. Without /kill this would 409 forever.
+    const followupArgs = testHelper.getRunScriptStepDefinition()
+      .args as RunScriptStepArgs
+    await expect(runScriptStep(followupArgs, state)).resolves.not.toThrow()
 
     await expect(cleanupJob()).resolves.not.toThrow()
   })

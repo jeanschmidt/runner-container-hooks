@@ -73,6 +73,20 @@ function getInstall(): () => void {
   return require('../../src/safety/process-handlers').installProcessHandlers
 }
 
+/**
+ * Re-acquire the full process-handlers module, including registerCleanup /
+ * unregisterCleanup. Used by tests that need to manipulate the cleanup
+ * registry after install.
+ */
+function getMod(): {
+  installProcessHandlers: () => void
+  registerCleanup: (fn: () => Promise<void> | void) => void
+  unregisterCleanup: (fn: () => Promise<void> | void) => void
+} {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return require('../../src/safety/process-handlers')
+}
+
 // --------------------------------------------------------------------------
 // Tests
 // --------------------------------------------------------------------------
@@ -178,8 +192,7 @@ describe('installProcessHandlers', () => {
   it('SIGTERM handler runs registered cleanup callbacks before exit', async () => {
     const { captured, restore } = captureProcessOn()
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const mod = require('../../src/safety/process-handlers')
+      const mod = getMod()
       mod.installProcessHandlers()
       const sigterm = captured.find(h => h.event === 'SIGTERM')
       expect(sigterm).toBeDefined()
@@ -200,8 +213,7 @@ describe('installProcessHandlers', () => {
   it('SIGTERM handler does not re-run cleanup callbacks on re-signal', async () => {
     const { captured, restore } = captureProcessOn()
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const mod = require('../../src/safety/process-handlers')
+      const mod = getMod()
       mod.installProcessHandlers()
       const sigterm = captured.find(h => h.event === 'SIGTERM')
 
@@ -221,8 +233,7 @@ describe('installProcessHandlers', () => {
   it('SIGTERM handler tolerates cleanup callback errors and still exits', async () => {
     const { captured, restore } = captureProcessOn()
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const mod = require('../../src/safety/process-handlers')
+      const mod = getMod()
       mod.installProcessHandlers()
       const sigterm = captured.find(h => h.event === 'SIGTERM')
 
@@ -242,8 +253,7 @@ describe('installProcessHandlers', () => {
   it('unregisterCleanup removes the callback', async () => {
     const { captured, restore } = captureProcessOn()
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const mod = require('../../src/safety/process-handlers')
+      const mod = getMod()
       mod.installProcessHandlers()
       const sigterm = captured.find(h => h.event === 'SIGTERM')
 
