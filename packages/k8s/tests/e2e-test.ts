@@ -162,12 +162,15 @@ describe('e2e', () => {
     const state = prepareJobOutputData.state
 
     // Build the hook input — a run_script_step that sleeps for 60s.
-    const scriptStepDefn = testHelper.getRunScriptStepDefinition()
-    scriptStepDefn.args.entryPoint = '/bin/sleep'
-    scriptStepDefn.args.entryPointArgs = ['60']
+    // HookData.args is a union; narrow to RunScriptStepArgs so the
+    // entryPoint/entryPointArgs writes type-check (TS2339 otherwise).
+    const scriptStepArgs = testHelper.getRunScriptStepDefinition()
+      .args as RunScriptStepArgs
+    scriptStepArgs.entryPoint = '/bin/sleep'
+    scriptStepArgs.entryPointArgs = ['60']
     const hookInput = JSON.stringify({
       command: 'run_script_step',
-      args: scriptStepDefn.args,
+      args: scriptStepArgs,
       state
     })
 
