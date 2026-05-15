@@ -207,11 +207,24 @@ class Handler(BaseHTTPRequestHandler):
         # is the GHA cancellation forwarding path — the hook calls /kill from
         # its SIGTERM/SIGINT handler so the in-pod subprocess exits and the
         # next exec doesn't see "A job is already running".
+        #
+        # Auth is checked inline rather than via the shared _check_auth helper
+        # because do_POST dispatches /exec and /kill BEFORE the global
+        # _check_auth call (see do_POST above). Matching the inline pattern
+        # of /exec avoids accidentally exposing /kill to unauthenticated
+        # requests if the dispatch order is ever reordered.
         token = self.headers.get("X-Auth-Token")
-        if token != _auth_token:
+        # `not token` catches the "no header sent" case (`None`) — without
+        # this, an unconfigured server (_auth_token == None) would accept
+        # tokenless requests because `None == None`. Matches /exec's check.
+        if not token or token != _auth_token:
             self.send_error(403, "Invalid auth token")
             return
         _kill_process()
+        # Return the just-killed job's status snapshot (id/status/exit_code)
+        # for symmetry with /status. Callers typically ignore the body — see
+        # killRpcJob() in rpc.ts — but having it lets operators introspect
+        # what was killed when debugging.
         with _lock:
             data = {
                 "id": _job_id,

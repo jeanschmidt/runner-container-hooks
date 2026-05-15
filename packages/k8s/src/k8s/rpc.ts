@@ -10,7 +10,10 @@ import {
 import { RPC_SERVER_SCRIPT } from './rpc-server-script'
 
 interface RpcStatusResponse {
-  id: string
+  // null when no job has run yet (server is in initial 'idle' state). The
+  // Python server sets _job_id = None at startup and only assigns a value
+  // when /exec accepts a job.
+  id: string | null
   status: 'idle' | 'running' | 'completed' | 'failed'
   exit_code: number | null
 }

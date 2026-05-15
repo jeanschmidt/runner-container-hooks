@@ -51,10 +51,18 @@ async function handleSignal(signal: 'SIGTERM' | 'SIGINT'): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   fatal(`received ${signal}`)
+  // Explicit timeout handle so we can clearTimeout when runCleanups wins
+  // the race. Without this the setTimeout keeps the event loop alive for
+  // up to CLEANUP_TIMEOUT_MS — fine in production (process.exit() runs
+  // immediately after) but it leaks in tests that spy on process.exit.
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined
   await Promise.race([
     runCleanups(),
-    new Promise<void>(resolve => setTimeout(resolve, CLEANUP_TIMEOUT_MS))
+    new Promise<void>(resolve => {
+      timeoutHandle = setTimeout(resolve, CLEANUP_TIMEOUT_MS)
+    })
   ])
+  if (timeoutHandle !== undefined) clearTimeout(timeoutHandle)
   // 130 for SIGINT, 143 for SIGTERM — the standard 128+signum convention.
   // Surfaces the cause to the OSDC wrapper (and to anyone reading the log).
   process.exit(signal === 'SIGINT' ? 130 : 143)

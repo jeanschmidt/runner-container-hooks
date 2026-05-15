@@ -1,4 +1,6 @@
+import { spawn } from 'child_process'
 import * as fs from 'fs'
+import * as path from 'path'
 import {
   cleanupJob,
   prepareJob,
@@ -124,6 +126,84 @@ describe('e2e', () => {
 
     // The point of the patch: a second runScriptStep against the same pod
     // must succeed. Without /kill this would 409 forever.
+    const followupArgs = testHelper.getRunScriptStepDefinition()
+      .args as RunScriptStepArgs
+    await expect(runScriptStep(followupArgs, state)).resolves.not.toThrow()
+
+    await expect(cleanupJob()).resolves.not.toThrow()
+  })
+
+  // Stronger version of the test above: exercises the full SIGTERM path
+  // (process.on('SIGTERM') -> handleSignal -> runCleanups -> killRpcJob)
+  // by spawning the production-built hook binary (packages/k8s/dist/index.js)
+  // as a real subprocess and sending it a real SIGTERM. Catches any wiring
+  // regression that bypasses the cleanup-callback registry — something the
+  // direct killRpcJob() call in the previous test cannot detect.
+  //
+  // Requires `npm run build-all` to have produced dist/index.js, which the
+  // k8s-tests CI workflow already does as a prerequisite step.
+  it('SIGTERM to the hook subprocess clears the workflow pod for the next /exec', async () => {
+    jest.setTimeout(120000)
+
+    const distEntry = path.resolve(__dirname, '../dist/index.js')
+    if (!fs.existsSync(distEntry)) {
+      throw new Error(
+        `Expected built hook at ${distEntry}; run \`npm run build-all\` first.`
+      )
+    }
+
+    // prepareJob sets up the workflow pod + RPC server.
+    await expect(
+      prepareJob(prepareJobData.args, prepareJobOutputFilePath)
+    ).resolves.not.toThrow()
+    const prepareJobOutputData = JSON.parse(
+      fs.readFileSync(prepareJobOutputFilePath).toString()
+    )
+    const state = prepareJobOutputData.state
+
+    // Build the hook input — a run_script_step that sleeps for 60s.
+    const scriptStepDefn = testHelper.getRunScriptStepDefinition()
+    scriptStepDefn.args.entryPoint = '/bin/sleep'
+    scriptStepDefn.args.entryPointArgs = ['60']
+    const hookInput = JSON.stringify({
+      command: 'run_script_step',
+      args: scriptStepDefn.args,
+      state
+    })
+
+    // Spawn the compiled hook with the test process's env (so it inherits
+    // ACTIONS_RUNNER_POD_NAME, RUNNER_WORKSPACE, etc. set up by
+    // TestHelper.initialize).
+    const child = spawn('node', [distEntry], {
+      env: process.env,
+      stdio: ['pipe', 'inherit', 'inherit']
+    })
+    child.stdin.write(hookInput)
+    child.stdin.end()
+
+    // Wait long enough for the hook to (a) parse stdin, (b) reach
+    // rpcPodStep, (c) issue /exec, (d) start polling /status. Empirically
+    // ~3-5s in kind; we give a generous 6s.
+    await new Promise(r => setTimeout(r, 6000))
+
+    // The actual test — real SIGTERM to a real subprocess.
+    child.kill('SIGTERM')
+
+    const childExit = await new Promise<{
+      code: number | null
+      signal: NodeJS.Signals | null
+    }>(resolve => child.on('exit', (code, signal) => resolve({ code, signal })))
+    // Either 143 (handler caught SIGTERM and process.exit(143)) or a non-
+    // zero code from the rpcPodStep throw path. Must NOT be 0.
+    expect(
+      childExit.code === 143 ||
+        (childExit.code !== null && childExit.code !== 0)
+    ).toBe(true)
+
+    // The killer test: with /kill forwarded into the pod, the next
+    // runScriptStep against the same pod/RPC server must succeed. Without
+    // the patch, /exec would 409 here ("A job is already running") because
+    // the in-pod sleep is still alive.
     const followupArgs = testHelper.getRunScriptStepDefinition()
       .args as RunScriptStepArgs
     await expect(runScriptStep(followupArgs, state)).resolves.not.toThrow()
