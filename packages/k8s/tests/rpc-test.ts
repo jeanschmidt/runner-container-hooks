@@ -94,6 +94,7 @@ describe('deployRpcServer', () => {
    */
   function setupDefaultMocks(overrides?: {
     python3?: StepResult | Error
+    aptInstall?: StepResult | Error
     write?: StepResult | Error
     start?: StepResult | Error
     port?: StepResult
@@ -101,6 +102,8 @@ describe('deployRpcServer', () => {
   }): void {
     const defaults = {
       python3: { exitCode: 0, stdout: 'Python 3.10.0' } as StepResult | Error,
+      // Default: apt-install path is not exercised, but if it is, succeed.
+      aptInstall: { exitCode: 0, stdout: '' } as StepResult | Error,
       write: { exitCode: 0, stdout: '' } as StepResult | Error,
       start: { exitCode: 0, stdout: '12345' } as StepResult | Error,
       port: { exitCode: 0, stdout: String(DISCOVERED_PORT) },
@@ -113,6 +116,8 @@ describe('deployRpcServer', () => {
       let result: StepResult | Error
       if (cmdStr.includes('python3') && cmdStr.includes('--version')) {
         result = cfg.python3
+      } else if (cmdStr.includes('apt-get install') && cmdStr.includes('python3')) {
+        result = cfg.aptInstall
       } else if (
         cmdStr.includes('base64 -d') &&
         cmdStr.includes('rpc-server.py')
@@ -170,26 +175,57 @@ describe('deployRpcServer', () => {
     expect(pythonCall[3]).toBe('check python3')
   })
 
-  it('should throw if python3 is not available', async () => {
+  it('should attempt apt install when python3 is not available', async () => {
     setupDefaultMocks({
       python3: new Error(
         'non-zero exit code 127 (stdout: sh: python3: not found)'
       )
     })
 
-    await expect(
-      deployRpcServer('my-pod', 'my-container', 'tok-123')
-    ).rejects.toThrow('image not compatible: python3 is a required dependency')
+    await deployRpcServer('my-pod', 'my-container', 'tok-123')
+
+    const aptCall = mockExecPodStepOutputWithRetry.mock.calls.find(
+      ([cmd]) =>
+        cmd.join(' ').includes('apt-get install') &&
+        cmd.join(' ').includes('python3')
+    )
+    expect(aptCall).toBeDefined()
+    expect(aptCall[0][0]).toBe('sh')
+    expect(aptCall[0][1]).toBe('-c')
+    expect(aptCall[0][2]).toContain('apt-get update')
+    expect(aptCall[3]).toBe('install python3')
   })
 
-  it('should throw if python3 check has infrastructure error', async () => {
+  it('should attempt apt install when python3 check has infrastructure error', async () => {
     setupDefaultMocks({
       python3: new Error('WebSocket closed')
     })
 
+    await deployRpcServer('my-pod', 'my-container', 'tok-123')
+
+    const aptCall = mockExecPodStepOutputWithRetry.mock.calls.find(
+      ([cmd]) =>
+        cmd.join(' ').includes('apt-get install') &&
+        cmd.join(' ').includes('python3')
+    )
+    expect(aptCall).toBeDefined()
+  })
+
+  it('should throw if apt install also fails', async () => {
+    setupDefaultMocks({
+      python3: new Error(
+        'non-zero exit code 127 (stdout: sh: python3: not found)'
+      ),
+      aptInstall: new Error(
+        'non-zero exit code 100 (stdout: E: Unable to locate package python3)'
+      )
+    })
+
     await expect(
       deployRpcServer('my-pod', 'my-container', 'tok-123')
-    ).rejects.toThrow('image not compatible: python3 is a required dependency')
+    ).rejects.toThrow(
+      'image not compatible: python3 is a required dependency and apt install failed'
+    )
   })
 
   it('should throw if pod has no IP address', async () => {
@@ -383,16 +419,19 @@ describe('deployRpcServer', () => {
     ).rejects.toThrow('RPC server failed after 3 attempts')
   })
 
-  it('should include details in python3 error message', async () => {
+  it('should include apt error details when apt install fails', async () => {
     setupDefaultMocks({
       python3: new Error(
         'non-zero exit code 127 (stdout: sh: python3: not found)'
+      ),
+      aptInstall: new Error(
+        'non-zero exit code 100 (stdout: E: Could not open lock file)'
       )
     })
 
     await expect(
       deployRpcServer('my-pod', 'my-container', 'tok-123')
-    ).rejects.toThrow('sh: python3: not found')
+    ).rejects.toThrow('E: Could not open lock file')
   })
 
   it('should include details in script write error message', async () => {
