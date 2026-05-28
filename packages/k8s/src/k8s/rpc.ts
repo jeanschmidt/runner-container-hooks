@@ -104,10 +104,25 @@ export async function deployRpcServer(
       'check python3',
       { retryOnNonZeroExit: true }
     )
-  } catch (err) {
-    throw new Error(
-      `image not compatible: python3 is a required dependency (${err instanceof Error ? err.message : err})`
-    )
+  } catch {
+    core.info('python3 not found, attempting apt install')
+    try {
+      await execPodStepOutputWithRetry(
+        [
+          'sh',
+          '-c',
+          'apt-get update && apt-get install -y --no-install-recommends python3'
+        ],
+        podName,
+        containerName,
+        'install python3',
+        { retryOnNonZeroExit: true }
+      )
+    } catch (err) {
+      throw new Error(
+        `image not compatible: python3 is a required dependency and apt install failed (${err instanceof Error ? err.message : err})`
+      )
+    }
   }
 
   const encoded = Buffer.from(RPC_SERVER_SCRIPT).toString('base64')
