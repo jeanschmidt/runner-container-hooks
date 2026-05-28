@@ -7,7 +7,7 @@ import {
   execPodStepOutputWithRetry,
   getPodByName
 } from './index'
-import { RPC_SERVER_SCRIPT } from './rpc-server-script'
+import { RPC_SERVER_AMD64, RPC_SERVER_ARM64 } from './rpc-server-script'
 
 interface RpcStatusResponse {
   // null when no job has run yet (server is in initial 'idle' state). The
@@ -38,21 +38,20 @@ function rpcUrl(podIp: string, port: number, path: string): string {
 }
 
 async function healthCheck(
-  podName: string,
-  containerName: string,
+  podIp: string,
   port: number
 ): Promise<boolean> {
+  // Health-check from the hook side via outbound HTTP. Avoids depending on
+  // any in-pod tool (curl/wget/nc/python) — the binary listens on the pod IP
+  // and the hook process can reach it directly.
   try {
-    const exitCode = await execPodStep(
-      [
-        'sh',
-        '-c',
-        `python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:${port}/health')"`
-      ],
-      podName,
-      containerName
-    )
-    return exitCode === 0
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 2000)
+    const resp = await fetch(rpcUrl(podIp, port, '/health'), {
+      signal: controller.signal
+    })
+    clearTimeout(timer)
+    return resp.ok
   } catch {
     return false
   }
@@ -96,27 +95,40 @@ export async function deployRpcServer(
     throw new Error(`Pod ${podName} has no IP address`)
   }
 
+  // Pick the right static binary for the pod's architecture. The binary is
+  // musl-linked so it runs on glibc, musl (Alpine), distroless and scratch
+  // alike — no python3/node/libc required in the image.
+  let arch: string
   try {
-    await execPodStepOutputWithRetry(
-      ['python3', '--version'],
+    const { stdout } = await execPodStepOutput(
+      ['uname', '-m'],
       podName,
-      containerName,
-      'check python3',
-      { retryOnNonZeroExit: true }
+      containerName
     )
+    arch = stdout.trim()
   } catch (err) {
     throw new Error(
-      `image not compatible: python3 is a required dependency (${err instanceof Error ? err.message : err})`
+      `RPC: failed to detect pod arch (${err instanceof Error ? err.message : err})`
     )
   }
 
-  const encoded = Buffer.from(RPC_SERVER_SCRIPT).toString('base64')
+  let binaryB64: string
+  if (arch === 'x86_64' || arch === 'amd64') {
+    binaryB64 = RPC_SERVER_AMD64
+  } else if (arch === 'aarch64' || arch === 'arm64') {
+    binaryB64 = RPC_SERVER_ARM64
+  } else {
+    throw new Error(
+      `RPC: unsupported pod arch "${arch}" — only x86_64/amd64 and aarch64/arm64 are supported`
+    )
+  }
+
   try {
     await execPodStepOutputWithRetry(
       [
         'sh',
         '-c',
-        `echo '${encoded}' | base64 -d > /tmp/rpc-server.py && chmod +x /tmp/rpc-server.py`
+        `echo '${binaryB64}' | base64 -d > /tmp/rpc-server && chmod +x /tmp/rpc-server`
       ],
       podName,
       containerName,
@@ -125,7 +137,7 @@ export async function deployRpcServer(
     )
   } catch (err) {
     throw new Error(
-      `RPC server script write failed (${err instanceof Error ? err.message : err})`
+      `RPC server binary write failed (${err instanceof Error ? err.message : err})`
     )
   }
 
@@ -142,7 +154,7 @@ export async function deployRpcServer(
         [
           'sh',
           '-c',
-          `pkill -f 'python3 /tmp/rpc-server.py' 2>/dev/null; rm -f ${PORT_FILE}`
+          `pkill -f '/tmp/rpc-server' 2>/dev/null; rm -f ${PORT_FILE}`
         ],
         podName,
         containerName
@@ -159,7 +171,7 @@ export async function deployRpcServer(
         [
           'sh',
           '-c',
-          `nohup python3 /tmp/rpc-server.py --port 0 --token ${token} > /tmp/rpc-server.log 2>&1 & echo $!`
+          `nohup /tmp/rpc-server --port 0 --token ${token} > /tmp/rpc-server.log 2>&1 & echo $!`
         ],
         podName,
         containerName,
@@ -185,7 +197,7 @@ export async function deployRpcServer(
     const startTime = Date.now()
     let healthy = false
     while (Date.now() - startTime < HEALTH_TIMEOUT_MS) {
-      if (await healthCheck(podName, containerName, port)) {
+      if (await healthCheck(podIp, port)) {
         core.debug(`RPC server healthy after ${Date.now() - startTime}ms`)
         healthy = true
         break
