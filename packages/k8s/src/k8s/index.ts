@@ -1397,6 +1397,56 @@ export async function pruneSecrets(): Promise<void> {
   )
 }
 
+// Best-effort: describe WHY a pod is unhealthy. Reads the pod-level
+// reason/message (set by the kubelet for admission rejections like
+// TopologyAffinityError / UnexpectedAdmissionError) and any container
+// terminated/waiting reasons. Returns a bare detail string (no phase prefix —
+// the caller's catch adds that), or '' when nothing useful is available.
+// Never throws — on a read failure it returns a short note instead.
+async function describePodUnhealth(podName: string): Promise<string> {
+  try {
+    const pod = await getPodByName(podName)
+    const parts: string[] = []
+    if (pod.status?.reason) {
+      parts.push(`reason=${pod.status.reason}`)
+    }
+    if (pod.status?.message) {
+      parts.push(`message=${pod.status.message}`)
+    }
+    const containerDetail = [
+      ...(pod.status?.initContainerStatuses ?? []),
+      ...(pod.status?.containerStatuses ?? [])
+    ]
+      .map(cs => {
+        const terminated = cs.state?.terminated
+        const waiting = cs.state?.waiting
+        if (terminated) {
+          const bits = [
+            terminated.reason,
+            terminated.message,
+            `exitCode=${terminated.exitCode}`
+          ].filter(Boolean)
+          return `${cs.name}: ${bits.join(' ')}`
+        }
+        if (waiting) {
+          const bits = [waiting.reason, waiting.message].filter(Boolean)
+          return `${cs.name}: ${bits.join(' ')}`
+        }
+        return undefined
+      })
+      .filter(Boolean)
+      .join('; ')
+    if (containerDetail) {
+      parts.push(`containers=[${containerDetail}]`)
+    }
+    return parts.join(', ')
+  } catch (err) {
+    return `(failed to read pod status: ${
+      err instanceof Error ? err.message : String(err)
+    })`
+  }
+}
+
 export async function waitForPodPhases(
   podName: string,
   awaitingPhases: Set<PodPhase>,
@@ -1415,9 +1465,7 @@ export async function waitForPodPhases(
       }
 
       if (!backOffPhases.has(phase)) {
-        throw new Error(
-          `Pod ${podName} is unhealthy with phase status ${phase}`
-        )
+        throw new Error(await describePodUnhealth(podName))
       }
 
       const elapsed = Math.round((Date.now() - startTime) / 1000)
