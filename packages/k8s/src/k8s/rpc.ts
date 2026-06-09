@@ -41,16 +41,19 @@ async function healthCheck(podIp: string, port: number): Promise<boolean> {
   // Health-check from the hook side via outbound HTTP. Avoids depending on
   // any in-pod tool (curl/wget/nc/python) — the binary listens on the pod IP
   // and the hook process can reach it directly.
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 2000)
   try {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 2000)
     const resp = await fetch(rpcUrl(podIp, port, '/health'), {
       signal: controller.signal
     })
-    clearTimeout(timer)
     return resp.ok
   } catch {
     return false
+  } finally {
+    // Always clear the timer — on the throw/abort path the success-only
+    // clearTimeout was skipped, leaking a pending timer across polls.
+    clearTimeout(timer)
   }
 }
 

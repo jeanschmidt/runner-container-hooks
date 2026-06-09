@@ -36,8 +36,13 @@ impl Server {
         let deadline = Instant::now() + Duration::from_secs(5);
         let port = loop {
             line.clear();
-            if reader.read_line(&mut line).is_err() {
-                panic!("rpc-server exited before printing port: {line}");
+            match reader.read_line(&mut line) {
+                Err(e) => panic!("error reading rpc-server stdout: {e}"),
+                // EOF: child closed stdout (almost certainly exited) before
+                // announcing its port. Fail now instead of spinning to the
+                // deadline and reporting a misleading timeout.
+                Ok(0) => panic!("rpc-server exited before printing port"),
+                Ok(_) => {}
             }
             if let Some(rest) = line.strip_prefix("RPC server listening on [::]:") {
                 break rest.trim().parse().expect("parse port");

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Embed pre-built static rpc-server binaries (amd64 + arm64) into a TS module
 // exported as base64 strings. The binaries are produced by
-// scripts/build-rpc-server.sh and live in packages/k8s/dist/.
+// scripts/build-rpc-server.sh and live in packages/k8s/rpc-server/binaries/.
 //
 // To update: edit rpc-server/src/main.rs, run scripts/build-rpc-server.sh,
 // then run this script.

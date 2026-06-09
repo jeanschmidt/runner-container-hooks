@@ -524,18 +524,15 @@ fn start_heartbeat_watchdog(state: SharedState) {
     });
 }
 
-// Signal handler must be async-signal-safe. We poke a flag and let the main
-// thread observe it — but since the main thread is blocked in tiny_http's
-// accept loop, simplest correct thing is to install handlers that kill the
-// child and call _exit. We won't get a clean shutdown of the listener, but
-// the pod is going away anyway.
+// Signal handler must be async-signal-safe, so it does the minimum: just
+// _exit(0). It does NOT kill the running child/job — the child lives in its
+// own session (see pre_exec setsid), so killpg wouldn't reach it anyway, and
+// tracking the pid to kill it here would mean touching a mutex from signal
+// context, which isn't async-signal-safe. On SIGTERM/SIGINT the pod is being
+// torn down, so the kernel reaps this process and pod teardown GCs whatever
+// job process remains. We forgo a clean listener shutdown for the same reason.
 extern "C" fn signal_handler(_signum: libc::c_int) {
     unsafe {
-        // Best effort: kill our process group (this terminates the child too
-        // since we put it in its own session, killpg won't reach it — so
-        // signal the recorded child pid through the global if present.
-        // Simpler: just _exit; the kernel will reap our child via init.
-        // The user-job process group remains, but pod termination will GC it.
         libc::_exit(0);
     }
 }
