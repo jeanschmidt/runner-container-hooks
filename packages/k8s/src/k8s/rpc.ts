@@ -65,8 +65,11 @@ async function discoverPort(
   const startTime = Date.now()
   while (Date.now() - startTime < PORT_DISCOVER_TIMEOUT_MS) {
     try {
+      // 2>/dev/null: the file doesn't exist until the server has bound and
+      // written it, so the first few polls would otherwise spam the runner's
+      // stderr with "cat: /tmp/rpc-server.port: No such file or directory".
       const { exitCode, stdout } = await execPodStepOutput(
-        ['cat', PORT_FILE],
+        ['sh', '-c', `cat ${PORT_FILE} 2>/dev/null`],
         podName,
         containerName
       )
