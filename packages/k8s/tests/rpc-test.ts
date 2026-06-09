@@ -44,11 +44,21 @@ jest.mock('crypto', () => {
   }
 })
 
+import * as stream from 'stream'
 import { deployRpcServer, killRpcJob, rpcPodStep } from '../src/k8s/rpc'
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
+
+/** Drain a Readable (the exec stdin carrying the base64 blob) to a string. */
+async function readStreamToString(s: stream.Readable): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of s) {
+    chunks.push(Buffer.from(chunk))
+  }
+  return Buffer.concat(chunks).toString()
+}
 
 /** Build a minimal Response-like object that satisfies the fetch API. */
 function fakeResponse(
@@ -114,25 +124,23 @@ describe('deployRpcServer', () => {
     }
     const cfg = { ...defaults, ...overrides }
 
-    mockExecPodStepOutputWithRetry.mockImplementation(async (cmd: string[]) => {
+    // The binary write streams the base64 over execPodStep's stdin (the blob
+    // is too large for argv), so it's routed through mockExecPodStep below.
+    // execPodStepOutputWithRetry now only handles the server start (nohup).
+    mockExecPodStepOutputWithRetry.mockImplementation(async () => {
+      if (cfg.start instanceof Error) throw cfg.start
+      return cfg.start
+    })
+
+    mockExecPodStep.mockImplementation(async (cmd: string[]) => {
       const cmdStr = cmd.join(' ')
-      let result: StepResult | Error
-      if (
-        cmdStr.includes('base64 -d') &&
-        cmdStr.includes('/tmp/rpc-server') &&
-        !cmdStr.includes('--port')
-      ) {
-        result = cfg.write
-      } else if (
-        cmdStr.includes('nohup') &&
-        cmdStr.includes('/tmp/rpc-server')
-      ) {
-        result = cfg.start
-      } else {
-        result = cfg.start
+      if (cmdStr.includes('base64 -d') && cmdStr.includes('/tmp/rpc-server')) {
+        // Binary write. execPodStep resolves to an exit code (number).
+        if (cfg.write instanceof Error) throw cfg.write
+        return cfg.write.exitCode
       }
-      if (result instanceof Error) throw result
-      return result
+      // Other execPodStep calls in deploy (e.g. the pkill/rm cleanup).
+      return 0
     })
 
     mockExecPodStepOutput.mockImplementation(async (cmd: string[]) => {
@@ -213,19 +221,21 @@ describe('deployRpcServer', () => {
     setupDefaultMocks({ arch: { exitCode: 0, stdout: 'aarch64\n' } })
     await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
-    const writeCall = mockExecPodStepOutputWithRetry.mock.calls.find(([cmd]) =>
-      cmd.join(' ').includes('/tmp/rpc-server')
+    const writeCall = mockExecPodStep.mock.calls.find(([cmd]) =>
+      cmd.join(' ').includes('base64 -d')
     )
-    expect(writeCall[0][2]).toContain('ZmFrZS1hcm02NA==')
+    expect(writeCall).toBeDefined()
+    expect(await readStreamToString(writeCall[3])).toBe('ZmFrZS1hcm02NA==')
   })
 
   it('should select amd64 binary for x86_64 pod', async () => {
     await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
-    const writeCall = mockExecPodStepOutputWithRetry.mock.calls.find(([cmd]) =>
+    const writeCall = mockExecPodStep.mock.calls.find(([cmd]) =>
       cmd.join(' ').includes('base64 -d')
     )
-    expect(writeCall[0][2]).toContain('ZmFrZS1hbWQ2NA==')
+    expect(writeCall).toBeDefined()
+    expect(await readStreamToString(writeCall[3])).toBe('ZmFrZS1hbWQ2NA==')
   })
 
   it('should throw if pod has no IP address', async () => {
@@ -236,10 +246,10 @@ describe('deployRpcServer', () => {
     ).rejects.toThrow('Pod my-pod has no IP address')
   })
 
-  it('should deploy the binary via base64 encoding', async () => {
+  it('should deploy the binary via base64 streamed over stdin', async () => {
     await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
-    const writeCall = mockExecPodStepOutputWithRetry.mock.calls.find(([cmd]) =>
+    const writeCall = mockExecPodStep.mock.calls.find(([cmd]) =>
       cmd.join(' ').includes('base64 -d')
     )
     expect(writeCall).toBeDefined()
@@ -248,7 +258,10 @@ describe('deployRpcServer', () => {
     expect(writeCall[0][2]).toContain('base64 -d')
     expect(writeCall[0][2]).toContain('/tmp/rpc-server')
     expect(writeCall[0][2]).toContain('chmod +x')
-    expect(writeCall[3]).toBe('write rpc server')
+    // The blob must NOT be inlined in argv (that would blow past MAX_ARG_STRLEN);
+    // it's streamed over stdin (the 4th arg) instead.
+    expect(writeCall[0][2]).not.toContain('ZmFrZS1hbWQ2NA==')
+    expect(writeCall[3]).toBeDefined()
   })
 
   it('should throw if binary write fails', async () => {

@@ -1,5 +1,6 @@
 import * as core from '@actions/core'
 import * as crypto from 'crypto'
+import { Readable } from 'stream'
 import { sleep } from './utils'
 import {
   execPodStep,
@@ -123,21 +124,39 @@ export async function deployRpcServer(
     )
   }
 
-  try {
-    await execPodStepOutputWithRetry(
-      [
-        'sh',
-        '-c',
-        `echo '${binaryB64}' | base64 -d > /tmp/rpc-server && chmod +x /tmp/rpc-server`
-      ],
-      podName,
-      containerName,
-      'write rpc server',
-      { retryOnNonZeroExit: true }
-    )
-  } catch (err) {
+  // Stream the base64 blob over the exec's stdin and decode it in-pod, rather
+  // than inlining it as a shell argument. The blob is ~830 KB; passing it as
+  // argv (`echo '<base64>'`) blows past Linux's MAX_ARG_STRLEN (128 KiB per
+  // single argument), so the kernel fails to exec `sh` with "argument list too
+  // long" — and the failing exec then hangs the websocket until the 60s
+  // per-call timeout, six times over. stdin has no such size limit.
+  let wrote = false
+  let lastWriteErr: unknown
+  for (let attempt = 1; attempt <= MAX_DEPLOY_ATTEMPTS; attempt++) {
+    try {
+      // Fresh stream per attempt — a Readable can only be consumed once.
+      const stdin = Readable.from([Buffer.from(binaryB64)])
+      const exitCode = await execPodStep(
+        ['sh', '-c', 'base64 -d > /tmp/rpc-server && chmod +x /tmp/rpc-server'],
+        podName,
+        containerName,
+        stdin
+      )
+      if (exitCode === 0) {
+        wrote = true
+        break
+      }
+      lastWriteErr = new Error(`base64 decode exited ${exitCode}`)
+    } catch (err) {
+      lastWriteErr = err
+    }
+    if (attempt < MAX_DEPLOY_ATTEMPTS) {
+      await sleep(1000 * attempt)
+    }
+  }
+  if (!wrote) {
     throw new Error(
-      `RPC server binary write failed (${err instanceof Error ? err.message : err})`
+      `RPC server binary write failed (${lastWriteErr instanceof Error ? lastWriteErr.message : lastWriteErr})`
     )
   }
 
