@@ -146,9 +146,7 @@ fn parse_simple_obj(body: &str) -> Option<std::collections::HashMap<String, Stri
     }
 }
 
-fn parse_json_string(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Option<String> {
+fn parse_json_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
     if chars.next()? != '"' {
         return None;
     }
@@ -187,9 +185,7 @@ fn parse_json_string(
 fn json_response(body: String, status: u16) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string(body)
         .with_status_code(status)
-        .with_header(
-            Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-        )
+        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
 }
 
 fn empty(status: u16) -> Response<std::io::Empty> {
@@ -198,7 +194,10 @@ fn empty(status: u16) -> Response<std::io::Empty> {
 
 fn check_auth(req: &Request, expected: &str) -> bool {
     req.headers().iter().any(|h| {
-        h.field.as_str().as_str().eq_ignore_ascii_case("X-Auth-Token")
+        h.field
+            .as_str()
+            .as_str()
+            .eq_ignore_ascii_case("X-Auth-Token")
             && h.value.as_str() == expected
     })
 }
@@ -364,7 +363,10 @@ fn handle_exec(mut req: Request, state: &SharedState) {
         return;
     };
     let (Some(job_id), Some(path)) = (obj.get("id"), obj.get("path")) else {
-        let _ = req.respond(json_response(r#"{"error":"missing id or path"}"#.into(), 400));
+        let _ = req.respond(json_response(
+            r#"{"error":"missing id or path"}"#.into(),
+            400,
+        ));
         return;
     };
 
@@ -642,4 +644,3 @@ fn main() {
         thread::spawn(move || dispatch(req, s));
     }
 }
-

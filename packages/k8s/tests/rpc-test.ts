@@ -110,11 +110,7 @@ describe('deployRpcServer', () => {
       start: { exitCode: 0, stdout: '12345' } as StepResult | Error,
       port: { exitCode: 0, stdout: String(DISCOVERED_PORT) },
       log: { exitCode: 0, stdout: '(no log)' },
-      health: 'ok' as
-        | 'ok'
-        | 'fail-once-ok'
-        | 'always-fail'
-        | 'network-error'
+      health: 'ok' as 'ok' | 'fail-once-ok' | 'always-fail' | 'network-error'
     }
     const cfg = { ...defaults, ...overrides }
 
@@ -174,8 +170,7 @@ describe('deployRpcServer', () => {
 
     realFetch = global.fetch
     mockFetch = jest.fn()
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    global.fetch = mockFetch as any
+    global.fetch = mockFetch as unknown as typeof fetch
 
     mockGetPodByName.mockResolvedValue({
       status: { podIP: '10.0.0.1' }

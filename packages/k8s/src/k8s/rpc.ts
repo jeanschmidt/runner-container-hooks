@@ -37,10 +37,7 @@ function rpcUrl(podIp: string, port: number, path: string): string {
   return `http://${host}:${port}${path}`
 }
 
-async function healthCheck(
-  podIp: string,
-  port: number
-): Promise<boolean> {
+async function healthCheck(podIp: string, port: number): Promise<boolean> {
   // Health-check from the hook side via outbound HTTP. Avoids depending on
   // any in-pod tool (curl/wget/nc/python) — the binary listens on the pod IP
   // and the hook process can reach it directly.

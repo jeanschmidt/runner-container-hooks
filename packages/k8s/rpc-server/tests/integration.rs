@@ -47,11 +47,11 @@ impl Server {
             }
         };
 
-        Self { child, port, tmpdir }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{path}", self.port)
+        Self {
+            child,
+            port,
+            tmpdir,
+        }
     }
 
     fn raw(
@@ -61,8 +61,7 @@ impl Server {
         token: Option<&str>,
         body: Option<&str>,
     ) -> (u16, String) {
-        let mut stream =
-            TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
         use std::io::Write;
         let body = body.unwrap_or("");
         let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
@@ -220,7 +219,10 @@ fn logs_serve_stdout_and_stderr() {
     }
 
     let (_, out) = s.raw("GET", "/logs?stream=stdout", Some(TOKEN), None);
-    assert!(out.contains("out1") && out.contains("out2"), "stdout: {out}");
+    assert!(
+        out.contains("out1") && out.contains("out2"),
+        "stdout: {out}"
+    );
     let (_, err) = s.raw("GET", "/logs?stream=stderr", Some(TOKEN), None);
     assert!(err.contains("err1"), "stderr: {err}");
 }
