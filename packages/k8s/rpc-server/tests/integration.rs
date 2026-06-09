@@ -109,7 +109,6 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.tmpdir);
-        let _ = std::fs::remove_file("/tmp/rpc-server.port");
     }
 }
 

@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 const LOG_DIR: &str = "/tmp/rpc-logs";
-const PORT_FILE: &str = "/tmp/rpc-server.port";
 const MAX_CHUNK: usize = 1_048_576;
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 const KILL_GRACE: Duration = Duration::from_secs(5);
@@ -547,9 +546,10 @@ fn install_signal_handlers() {
     }
 }
 
-fn parse_args() -> (u16, String) {
+fn parse_args() -> (u16, String, bool) {
     let mut port: u16 = 8080;
     let mut token: Option<String> = None;
+    let mut daemonize = false;
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -560,10 +560,40 @@ fn parse_args() -> (u16, String) {
                     .expect("--port requires a number");
             }
             "--token" => token = args.next(),
+            // Print the listening port to stdout, then fork into the
+            // background and detach stdio so the launching `kubectl exec`
+            // returns. Off by default so tests can drive a foreground server.
+            "--daemonize" => daemonize = true,
             other => panic!("unknown arg: {other}"),
         }
     }
-    (port, token.expect("--token is required"))
+    (port, token.expect("--token is required"), daemonize)
+}
+
+/// Point stdin at /dev/null and stdout/stderr at the daemon log file, closing
+/// the daemon's inherited copies of the launching exec's stdio. Once these are
+/// redirected (and the parent has exited), the exec has no writers left on its
+/// pipes and returns.
+unsafe fn detach_stdio() {
+    let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+    if devnull >= 0 {
+        libc::dup2(devnull, libc::STDIN_FILENO);
+        if devnull > 2 {
+            libc::close(devnull);
+        }
+    }
+    let log = libc::open(
+        c"/tmp/rpc-server.log".as_ptr(),
+        libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+        0o644 as libc::c_int,
+    );
+    if log >= 0 {
+        libc::dup2(log, libc::STDOUT_FILENO);
+        libc::dup2(log, libc::STDERR_FILENO);
+        if log > 2 {
+            libc::close(log);
+        }
+    }
 }
 
 fn bind_dual_stack(port: u16) -> std::io::Result<TcpListener> {
@@ -616,7 +646,35 @@ fn bind_dual_stack(port: u16) -> std::io::Result<TcpListener> {
 }
 
 fn main() {
-    let (port, token) = parse_args();
+    let (port, token, daemonize) = parse_args();
+
+    // Bind first so the OS-assigned port (when --port 0) is known, and report
+    // it on stdout. The launcher reads this single line to learn the port —
+    // no port file, no polling.
+    let listener = bind_dual_stack(port).expect("bind");
+    let actual_port = listener.local_addr().expect("local_addr").port();
+    println!("RPC server listening on [::]:{actual_port}");
+    let _ = std::io::stdout().flush();
+
+    if daemonize {
+        // Detach from the launching `kubectl exec` so it returns once it has
+        // read the port line above. The fork() MUST happen here, before any
+        // thread is spawned below: forking a multithreaded process clones only
+        // the calling thread and can leave another thread's mutex locked in
+        // the child.
+        unsafe {
+            match libc::fork() {
+                -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+                0 => {
+                    // Child: lead a new session and move stdio off the exec's
+                    // pipes so the exec sees EOF and completes.
+                    libc::setsid();
+                    detach_stdio();
+                }
+                _ => libc::_exit(0), // Parent: let the exec complete.
+            }
+        }
+    }
 
     write_oom_score_adj_self("-1000");
     let _ = fs::create_dir_all(LOG_DIR);
@@ -624,13 +682,6 @@ fn main() {
 
     let state = Arc::new(Mutex::new(State::new(token)));
     start_heartbeat_watchdog(Arc::clone(&state));
-
-    let listener = bind_dual_stack(port).expect("bind");
-    let actual_port = listener.local_addr().expect("local_addr").port();
-    if let Ok(mut f) = File::create(PORT_FILE) {
-        let _ = f.write_all(actual_port.to_string().as_bytes());
-    }
-    println!("RPC server listening on [::]:{actual_port}");
 
     let server = Server::from_listener(listener, None).expect("server");
     let server = Arc::new(server);

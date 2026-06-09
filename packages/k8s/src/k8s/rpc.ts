@@ -2,12 +2,7 @@ import * as core from '@actions/core'
 import * as crypto from 'crypto'
 import { Readable } from 'stream'
 import { sleep } from './utils'
-import {
-  execPodStep,
-  execPodStepOutput,
-  execPodStepOutputWithRetry,
-  getPodByName
-} from './index'
+import { execPodStep, execPodStepOutput, getPodByName } from './index'
 import { RPC_SERVER_AMD64, RPC_SERVER_ARM64 } from './rpc-server-script'
 
 interface RpcStatusResponse {
@@ -27,9 +22,6 @@ const HEARTBEAT_GRACE_MS = 60000
 const LOG_POLL_INTERVAL_MS = 200
 const FETCH_TIMEOUT_MS = 10000
 const KILL_TIMEOUT_MS = 5000
-const PORT_FILE = '/tmp/rpc-server.port'
-const PORT_DISCOVER_TIMEOUT_MS = 5000
-const PORT_DISCOVER_POLL_MS = 200
 const DIAGNOSTIC_TIMEOUT_MS = 15000
 const DIAGNOSTIC_EXEC_TIMEOUT_MS = 10000
 
@@ -56,36 +48,6 @@ async function healthCheck(podIp: string, port: number): Promise<boolean> {
     // clearTimeout was skipped, leaking a pending timer across polls.
     clearTimeout(timer)
   }
-}
-
-async function discoverPort(
-  podName: string,
-  containerName: string
-): Promise<number | null> {
-  const startTime = Date.now()
-  while (Date.now() - startTime < PORT_DISCOVER_TIMEOUT_MS) {
-    try {
-      // 2>/dev/null: the file doesn't exist until the server has bound and
-      // written it, so the first few polls would otherwise spam the runner's
-      // stderr with "cat: /tmp/rpc-server.port: No such file or directory".
-      const { exitCode, stdout } = await execPodStepOutput(
-        ['sh', '-c', `cat ${PORT_FILE} 2>/dev/null`],
-        podName,
-        containerName
-      )
-      if (exitCode === 0 && stdout) {
-        const port = parseInt(stdout, 10)
-        if (!isNaN(port) && port > 0) {
-          core.debug(`Discovered RPC server port: ${port}`)
-          return port
-        }
-      }
-    } catch {
-      // Port file may not exist yet, keep polling
-    }
-    await sleep(PORT_DISCOVER_POLL_MS)
-  }
-  return null
 }
 
 export async function deployRpcServer(
@@ -170,14 +132,10 @@ export async function deployRpcServer(
       `Starting RPC server (attempt ${attempt}/${MAX_DEPLOY_ATTEMPTS})`
     )
 
-    // Kill any server from a previous failed attempt and clean up port file
+    // Kill any server left over from a previous failed attempt.
     try {
       await execPodStep(
-        [
-          'sh',
-          '-c',
-          `pkill -f '/tmp/rpc-server' 2>/dev/null; rm -f ${PORT_FILE}`
-        ],
+        ['sh', '-c', `pkill -f '/tmp/rpc-server' 2>/dev/null; true`],
         podName,
         containerName
       )
@@ -187,30 +145,28 @@ export async function deployRpcServer(
       )
     }
 
-    // Start server with port 0 — OS assigns a free port
+    // Start the server with --port 0 (OS picks a free port) and --daemonize:
+    // it prints "RPC server listening on [::]:PORT" to stdout, then forks into
+    // the background and detaches its stdio so this exec returns. We read the
+    // port straight from that line — no port file, no polling.
+    let port: number
     try {
-      await execPodStepOutputWithRetry(
-        [
-          'sh',
-          '-c',
-          `nohup /tmp/rpc-server --port 0 --token ${token} > /tmp/rpc-server.log 2>&1 & echo $!`
-        ],
+      const { exitCode, stdout } = await execPodStepOutput(
+        ['/tmp/rpc-server', '--port', '0', '--token', token, '--daemonize'],
         podName,
-        containerName,
-        'start rpc server',
-        { retryOnNonZeroExit: true }
+        containerName
       )
+      const match = stdout.match(/\[::\]:(\d+)/)
+      const parsed = match ? parseInt(match[1], 10) : NaN
+      if (exitCode !== 0 || isNaN(parsed) || parsed <= 0) {
+        throw new Error(
+          `could not parse listening port from server output (exit ${exitCode}): ${stdout || '(empty)'}`
+        )
+      }
+      port = parsed
+      core.debug(`RPC server reported port ${port}`)
     } catch (err) {
       const msg = `attempt ${attempt}: server start failed: ${err instanceof Error ? err.message : err}`
-      core.warning(msg)
-      attemptErrors.push(msg)
-      continue
-    }
-
-    // Discover the actual port assigned by the OS
-    const port = await discoverPort(podName, containerName)
-    if (port === null) {
-      const msg = `attempt ${attempt}: port discovery timed out (${PORT_DISCOVER_TIMEOUT_MS}ms)`
       core.warning(msg)
       attemptErrors.push(msg)
       continue

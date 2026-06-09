@@ -6,14 +6,11 @@ const MOCK_UUID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 
 const mockExecPodStep = jest.fn()
 const mockExecPodStepOutput = jest.fn()
-const mockExecPodStepOutputWithRetry = jest.fn()
 const mockGetPodByName = jest.fn()
 
 jest.mock('../src/k8s', () => ({
   execPodStep: (...args) => mockExecPodStep(...args),
   execPodStepOutput: (...args) => mockExecPodStepOutput(...args),
-  execPodStepOutputWithRetry: (...args) =>
-    mockExecPodStepOutputWithRetry(...args),
   getPodByName: (...args) => mockGetPodByName(...args)
 }))
 
@@ -102,36 +99,33 @@ describe('deployRpcServer', () => {
 
   /**
    * Route mocks by command content.
-   *   execPodStepOutput: `uname -m` (arch detect), port discovery, log tail.
-   *   execPodStepOutputWithRetry: binary write, server start.
+   *   execPodStep: binary write (base64 over stdin), pkill cleanup.
+   *   execPodStepOutput: `uname -m` (arch), server start (prints port), log tail.
    *   global.fetch: /health probe.
    */
   function setupDefaultMocks(overrides?: {
     arch?: StepResult | Error
     write?: StepResult | Error
     start?: StepResult | Error
-    port?: StepResult
     log?: StepResult
     health?: 'ok' | 'fail-once-ok' | 'always-fail' | 'network-error'
   }): void {
     const defaults = {
       arch: { exitCode: 0, stdout: 'x86_64\n' } as StepResult | Error,
       write: { exitCode: 0, stdout: '' } as StepResult | Error,
-      start: { exitCode: 0, stdout: '12345' } as StepResult | Error,
-      port: { exitCode: 0, stdout: String(DISCOVERED_PORT) },
+      // The server prints its listening line, then daemonizes; the hook reads
+      // the port from this stdout rather than from a file.
+      start: {
+        exitCode: 0,
+        stdout: `RPC server listening on [::]:${DISCOVERED_PORT}`
+      } as StepResult | Error,
       log: { exitCode: 0, stdout: '(no log)' },
       health: 'ok' as 'ok' | 'fail-once-ok' | 'always-fail' | 'network-error'
     }
     const cfg = { ...defaults, ...overrides }
 
     // The binary write streams the base64 over execPodStep's stdin (the blob
-    // is too large for argv), so it's routed through mockExecPodStep below.
-    // execPodStepOutputWithRetry now only handles the server start (nohup).
-    mockExecPodStepOutputWithRetry.mockImplementation(async () => {
-      if (cfg.start instanceof Error) throw cfg.start
-      return cfg.start
-    })
-
+    // is too large for argv), so it's routed through mockExecPodStep.
     mockExecPodStep.mockImplementation(async (cmd: string[]) => {
       const cmdStr = cmd.join(' ')
       if (cmdStr.includes('base64 -d') && cmdStr.includes('/tmp/rpc-server')) {
@@ -139,7 +133,7 @@ describe('deployRpcServer', () => {
         if (cfg.write instanceof Error) throw cfg.write
         return cfg.write.exitCode
       }
-      // Other execPodStep calls in deploy (e.g. the pkill/rm cleanup).
+      // Other execPodStep calls in deploy (e.g. the pkill cleanup).
       return 0
     })
 
@@ -149,10 +143,15 @@ describe('deployRpcServer', () => {
         if (cfg.arch instanceof Error) throw cfg.arch
         return cfg.arch
       }
+      // Server start: runs the binary with --daemonize; it prints the port.
+      if (cmd[0] === '/tmp/rpc-server') {
+        if (cfg.start instanceof Error) throw cfg.start
+        return cfg.start
+      }
       if (cmdStr.includes('tail') && cmdStr.includes('rpc-server.log')) {
         return cfg.log
       }
-      return cfg.port
+      return cfg.log
     })
 
     let healthCallCount = 0
@@ -274,33 +273,41 @@ describe('deployRpcServer', () => {
     ).rejects.toThrow('RPC server binary write failed')
   })
 
-  it('should start the server with --port 0 and correct --token args', async () => {
+  it('should start the server with --port 0, --daemonize and the token', async () => {
     await deployRpcServer('my-pod', 'my-container', 'tok-123')
 
-    const startCall = mockExecPodStepOutputWithRetry.mock.calls.find(([cmd]) =>
-      cmd.join(' ').includes('nohup /tmp/rpc-server')
+    const startCall = mockExecPodStepOutput.mock.calls.find(
+      ([cmd]) => cmd[0] === '/tmp/rpc-server'
     )
     expect(startCall).toBeDefined()
-    expect(startCall[0][2]).toContain('--port 0')
-    expect(startCall[0][2]).toContain('--token tok-123')
-    expect(startCall[3]).toBe('start rpc server')
+    expect(startCall[0]).toEqual([
+      '/tmp/rpc-server',
+      '--port',
+      '0',
+      '--token',
+      'tok-123',
+      '--daemonize'
+    ])
   })
 
   it('should continue to next attempt if server start fails', async () => {
+    setupDefaultMocks()
     let startCallCount = 0
-    mockExecPodStepOutputWithRetry.mockImplementation(async (cmd: string[]) => {
-      const cmdStr = cmd.join(' ')
-      if (cmdStr.includes('base64 -d')) {
-        return { exitCode: 0, stdout: '' }
+    mockExecPodStepOutput.mockImplementation(async (cmd: string[]) => {
+      if (cmd[0] === 'uname') {
+        return { exitCode: 0, stdout: 'x86_64\n' }
       }
-      if (cmdStr.includes('nohup') && cmdStr.includes('/tmp/rpc-server')) {
+      if (cmd[0] === '/tmp/rpc-server') {
         startCallCount++
         if (startCallCount === 1) {
-          throw new Error('start rpc server failed after 6 attempts')
+          throw new Error('exec into pod failed')
         }
-        return { exitCode: 0, stdout: '12345' }
+        return {
+          exitCode: 0,
+          stdout: `RPC server listening on [::]:${DISCOVERED_PORT}`
+        }
       }
-      return { exitCode: 0, stdout: '' }
+      return { exitCode: 0, stdout: '(no log)' }
     })
 
     const result = await deployRpcServer('my-pod', 'my-container', 'tok-123')
@@ -322,29 +329,31 @@ describe('deployRpcServer', () => {
     expect(result).toEqual({ podIp: '10.0.0.1', port: DISCOVERED_PORT })
   })
 
-  it('should retry if port discovery fails on first attempt', async () => {
+  it('should retry if the start output has no parseable port on first attempt', async () => {
     const SECOND_PORT = 55555
-    let portCallCount = 0
+    let startCallCount = 0
 
-    const realDateNow = Date.now
-    const startTime = realDateNow()
-    let timeOffset = 0
-    jest.spyOn(Date, 'now').mockImplementation(() => startTime + timeOffset)
-
+    setupDefaultMocks()
     mockExecPodStepOutput.mockImplementation(async (cmd: string[]) => {
       const cmdStr = cmd.join(' ')
       if (cmd[0] === 'uname') {
         return { exitCode: 0, stdout: 'x86_64\n' }
       }
+      if (cmd[0] === '/tmp/rpc-server') {
+        startCallCount++
+        // First attempt: server produced no recognizable "[::]:PORT" line.
+        if (startCallCount <= 1) {
+          return { exitCode: 0, stdout: '' }
+        }
+        return {
+          exitCode: 0,
+          stdout: `RPC server listening on [::]:${SECOND_PORT}`
+        }
+      }
       if (cmdStr.includes('tail') && cmdStr.includes('rpc-server.log')) {
         return { exitCode: 0, stdout: '(no log)' }
       }
-      portCallCount++
-      if (portCallCount <= 1) {
-        timeOffset += 6000
-        return { exitCode: 1, stdout: '' }
-      }
-      return { exitCode: 0, stdout: String(SECOND_PORT) }
+      return { exitCode: 0, stdout: '(no log)' }
     })
 
     const result = await deployRpcServer('my-pod', 'my-container', 'tok-123')
