@@ -23,12 +23,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/k8s/rpc-server
-      - name: Install cross (Docker-backed cross-compiler)
-        # `cross` runs cargo inside a per-target container that already has
-        # the right musl + linker bits, which avoids fighting apt packages
-        # for aarch64-musl on an x86_64 host. Docker is preinstalled on the
-        # ubuntu-latest runner.
-        run: cargo install cross --locked
       - run: npm ci
         name: Install dependencies
       - run: npm run bootstrap
@@ -77,8 +71,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/k8s/rpc-server
-      - run: cargo install cross --locked
-        name: Install cross
       - run: npm ci
         name: Install dependencies
       - run: npm run bootstrap
@@ -104,8 +96,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/k8s/rpc-server
-      - run: cargo install cross --locked
-        name: Install cross
       - run: sed -i "s|{{PATHTOREPO}}|$(pwd)|" packages/k8s/tests/test-kind.yaml
         name: Setup kind cluster yaml config
       - uses: helm/kind-action@v1.12.0
