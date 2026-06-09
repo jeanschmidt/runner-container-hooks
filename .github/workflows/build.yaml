@@ -42,9 +42,16 @@ jobs:
             ':!packages/k8s/src/k8s/rpc-server-script.ts'
 
   rust-tests:
-    name: Rust RPC Server Tests
-    runs-on: ubuntu-latest
+    name: Rust RPC Server Tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     needs: format-and-lint
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-24.04-arm is a free GitHub-hosted arm64 runner for public
+        # repos. Each runner builds + runs the binary for its native arch, so
+        # this exercises both the amd64 and the arm64 binary end-to-end.
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
