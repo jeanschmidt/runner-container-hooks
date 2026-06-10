@@ -515,6 +515,45 @@ fn heartbeats_keep_job_alive() {
     );
 }
 
+#[test]
+fn watchdog_kill_then_new_job_supervised() {
+    // Regression guard for the watchdog race fix: after the watchdog reaps a
+    // stale job A, a freshly-started job B must be supervised on its own terms —
+    // i.e. A's timeout handling must not have disarmed B, and B (kept alive by
+    // heartbeats) must run to completion rather than being collateral damage.
+    let s = Server::start_with_env(&[
+        ("RPC_HEARTBEAT_TIMEOUT_SECS", "2"),
+        ("RPC_WATCHDOG_TICK_SECS", "1"),
+    ]);
+
+    // Job A: never heartbeated -> watchdog kills it.
+    let long = s.write_script("a.sh", "#!/bin/sh\nsleep 30\n");
+    let a = format!(r#"{{"id":"A","path":"{long}"}}"#);
+    let (c, _) = s.raw("POST", "/exec", Some(TOKEN), Some(&a));
+    assert_eq!(c, 200);
+    let st = s.wait_terminal(Duration::from_secs(15));
+    assert!(
+        st.contains(r#""status":"failed""#),
+        "A should be killed: {st}"
+    );
+
+    // Job B: heartbeated throughout, must complete normally.
+    let brief = s.write_script("b.sh", "#!/bin/sh\nsleep 4\nexit 0\n");
+    let b = format!(r#"{{"id":"B","path":"{brief}"}}"#);
+    let (c, body) = s.raw("POST", "/exec", Some(TOKEN), Some(&b));
+    assert_eq!(c, 200, "B should be accepted after A died: {body}");
+    for _ in 0..12 {
+        let (hc, _) = s.raw("POST", "/heartbeat", Some(TOKEN), None);
+        assert_eq!(hc, 200);
+        thread::sleep(Duration::from_millis(500));
+    }
+    let (_, st) = s.raw("GET", "/status", Some(TOKEN), None);
+    assert!(
+        st.contains(r#""status":"completed""#) && st.contains(r#""id":"B""#),
+        "B should complete normally, got: {st}"
+    );
+}
+
 // --- /logs paging at MAX_CHUNK ---
 
 #[test]

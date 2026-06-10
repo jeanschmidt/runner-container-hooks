@@ -306,13 +306,26 @@ fn wait_for_process(state: SharedState, job_id: String, mut child: Child) {
     }
 }
 
-fn kill_running(state: &SharedState) {
-    // Snapshot pid + job_id so we can detect whether the waiter has progressed
-    // for the same job by the time we re-check.
-    let (pid, job_id) = {
+// Has the job slot moved on from `expected` — either reaped (exit_code set) or
+// replaced by a different /exec? Once true, there's nothing left for a killer
+// targeting `expected` to do.
+fn job_slot_settled(state: &SharedState, expected: &str) -> bool {
+    let s = state.lock().unwrap();
+    s.job_id.as_deref() != Some(expected) || s.exit_code.is_some()
+}
+
+// Kill the running job, but ONLY while it is still `expected`. SIGTERM the
+// process group, then escalate to SIGKILL after a grace period if it hasn't
+// died. If the slot has been reaped or replaced by a different job by the time
+// we look (or at any point during the grace window), this is a no-op — so a
+// timed-out job A can never have its SIGTERM land on an unrelated job B that
+// started in the meantime. The waiter thread owns reaping; we only signal and
+// observe the state transition.
+fn kill_running_if_match(state: &SharedState, expected: &str) {
+    let pid = {
         let s = state.lock().unwrap();
-        match (s.child_pid, s.job_id.clone()) {
-            (Some(pid), Some(jid)) if s.exit_code.is_none() => (pid, jid),
+        match (s.child_pid, s.job_id.as_deref()) {
+            (Some(pid), Some(jid)) if jid == expected && s.exit_code.is_none() => pid,
             _ => return,
         }
     };
@@ -328,12 +341,8 @@ fn kill_running(state: &SharedState) {
 
         let deadline = Instant::now() + grace;
         loop {
-            // Did the waiter notice the death and record the exit code?
-            {
-                let s = state.lock().unwrap();
-                if s.job_id.as_deref() == Some(&job_id) && s.exit_code.is_some() {
-                    return;
-                }
+            if job_slot_settled(state, expected) {
+                return;
             }
             if Instant::now() >= deadline {
                 libc::killpg(pgid, libc::SIGKILL);
@@ -341,11 +350,9 @@ fn kill_running(state: &SharedState) {
                 // so /kill's status snapshot reflects the death.
                 let kill_deadline = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < kill_deadline {
-                    let s = state.lock().unwrap();
-                    if s.job_id.as_deref() == Some(&job_id) && s.exit_code.is_some() {
+                    if job_slot_settled(state, expected) {
                         return;
                     }
-                    drop(s);
                     thread::sleep(Duration::from_millis(50));
                 }
                 return;
@@ -353,6 +360,21 @@ fn kill_running(state: &SharedState) {
             thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+// Kill whatever job is currently running (the /kill endpoint's semantics).
+// Snapshots the current job under the lock and delegates to the match-guarded
+// killer, so if a concurrent /exec swaps the job out mid-kill we stop rather
+// than escalate SIGKILL against a stale process group.
+fn kill_running(state: &SharedState) {
+    let expected = {
+        let s = state.lock().unwrap();
+        match (&s.job_id, s.exit_code) {
+            (Some(jid), None) => jid.clone(),
+            _ => return,
+        }
+    };
+    kill_running_if_match(state, &expected);
 }
 
 // --- Route handlers ---
@@ -532,18 +554,28 @@ fn start_heartbeat_watchdog(state: SharedState) {
     let tick = env_duration_secs("RPC_WATCHDOG_TICK_SECS", WATCHDOG_TICK_DEFAULT_SECS);
     thread::spawn(move || loop {
         thread::sleep(tick);
-        let should_kill = {
-            let s = state.lock().unwrap();
-            matches!(s.last_heartbeat, Some(t) if t.elapsed() > timeout)
+        // Atomically, under a single lock: (a) decide whether the heartbeat has
+        // timed out, (b) clear it, and (c) snapshot which job we intend to kill.
+        // Doing all three together means a /exec that lands after this point
+        // can't have its fresh heartbeat clobbered, and can't be killed in
+        // place of the job that actually timed out.
+        let target_job_id = {
+            let mut s = state.lock().unwrap();
+            let timed_out = matches!(s.last_heartbeat, Some(t) if t.elapsed() > timeout);
+            if !timed_out {
+                continue;
+            }
+            s.last_heartbeat = None;
+            s.job_id.clone()
         };
-        if should_kill {
-            eprintln!(
-                "Heartbeat timeout: no heartbeat for {}s, killing current process",
-                timeout.as_secs()
-            );
-            kill_running(&state);
-            state.lock().unwrap().last_heartbeat = None;
-        }
+        let Some(job_id) = target_job_id else {
+            continue;
+        };
+        eprintln!(
+            "Heartbeat timeout: no heartbeat for {}s, killing job {job_id}",
+            timeout.as_secs()
+        );
+        kill_running_if_match(&state, &job_id);
     });
 }
 
