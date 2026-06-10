@@ -18,8 +18,20 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 const LOG_DIR: &str = "/tmp/rpc-logs";
 const MAX_CHUNK: usize = 1_048_576;
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
-const KILL_GRACE: Duration = Duration::from_secs(5);
+
+// Lifecycle timeouts. Defaults match production; each is overridable via an
+// env var so integration tests can drive these paths without waiting minutes.
+const HEARTBEAT_TIMEOUT_DEFAULT_SECS: u64 = 60;
+const WATCHDOG_TICK_DEFAULT_SECS: u64 = 5;
+const KILL_GRACE_DEFAULT_SECS: u64 = 5;
+
+fn env_duration_secs(key: &str, default_secs: u64) -> Duration {
+    let secs = env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum JobStatus {
@@ -273,7 +285,15 @@ fn spawn_job(job_id: &str, script_path: &str) -> std::io::Result<Child> {
 // only one thread ever reaps. /kill signals via raw libc and waits for the
 // waiter to update the state.
 fn wait_for_process(state: SharedState, job_id: String, mut child: Child) {
-    let code = child.wait().ok().and_then(|st| st.code()).unwrap_or(-1);
+    use std::os::unix::process::ExitStatusExt;
+    // Preserve the cause of death: a normal exit yields its code; a process
+    // killed by a signal (SIGTERM/SIGKILL from /kill or the watchdog) has no
+    // exit code, so report the negated signal number (e.g. -9, -15) instead of
+    // a blanket -1.
+    let code = child
+        .wait()
+        .map(|st| st.code().or_else(|| st.signal().map(|s| -s)).unwrap_or(-1))
+        .unwrap_or(-1);
     let mut s = state.lock().unwrap();
     if s.job_id.as_deref() == Some(&job_id) {
         s.exit_code = Some(code);
@@ -297,6 +317,8 @@ fn kill_running(state: &SharedState) {
         }
     };
 
+    let grace = env_duration_secs("RPC_KILL_GRACE_SECS", KILL_GRACE_DEFAULT_SECS);
+
     unsafe {
         let pgid = libc::getpgid(pid);
         if pgid < 0 {
@@ -304,7 +326,7 @@ fn kill_running(state: &SharedState) {
         }
         libc::killpg(pgid, libc::SIGTERM);
 
-        let deadline = Instant::now() + KILL_GRACE;
+        let deadline = Instant::now() + grace;
         loop {
             // Did the waiter notice the death and record the exit code?
             {
@@ -506,16 +528,18 @@ fn dispatch(req: Request, state: SharedState) {
 // --- Watchdog + signals + main ---
 
 fn start_heartbeat_watchdog(state: SharedState) {
+    let timeout = env_duration_secs("RPC_HEARTBEAT_TIMEOUT_SECS", HEARTBEAT_TIMEOUT_DEFAULT_SECS);
+    let tick = env_duration_secs("RPC_WATCHDOG_TICK_SECS", WATCHDOG_TICK_DEFAULT_SECS);
     thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(tick);
         let should_kill = {
             let s = state.lock().unwrap();
-            matches!(s.last_heartbeat, Some(t) if t.elapsed() > HEARTBEAT_TIMEOUT)
+            matches!(s.last_heartbeat, Some(t) if t.elapsed() > timeout)
         };
         if should_kill {
             eprintln!(
                 "Heartbeat timeout: no heartbeat for {}s, killing current process",
-                HEARTBEAT_TIMEOUT.as_secs()
+                timeout.as_secs()
             );
             kill_running(&state);
             state.lock().unwrap().last_heartbeat = None;
