@@ -615,19 +615,27 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 // can take the state mutex and signal the child. Doing that work here instead
 // would mean locking a mutex from signal context, which can deadlock if the
 // signal interrupts a thread already holding it.
-extern "C" fn signal_handler(_signum: libc::c_int) {
+extern "C" fn signal_handler(signum: libc::c_int) {
     if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
         // Second signal: the operator/orchestrator is impatient — exit now
-        // rather than waiting out the graceful child-kill grace period.
-        unsafe { libc::_exit(0) };
+        // rather than waiting out the graceful child-kill grace period. Use the
+        // conventional 128+signum status so the cause is still visible.
+        unsafe { libc::_exit(128 + signum) };
     }
     let fd = SIGNAL_PIPE_WRITE.load(Ordering::Relaxed);
     if fd < 0 {
-        // No self-pipe (setup failed) — can't do graceful teardown, but we must
-        // still honor the signal rather than ignore it.
-        unsafe { libc::_exit(0) };
+        // No self-pipe (setup failed) — can't do graceful teardown, but still
+        // honor the signal AND exit with the proper signal-terminated status by
+        // restoring the default disposition and re-raising it.
+        unsafe {
+            libc::signal(signum, libc::SIG_DFL);
+            libc::raise(signum);
+            libc::_exit(128 + signum);
+        }
     }
-    let byte = 1u8;
+    // Hand the signal number to the worker thread so it can re-raise it after
+    // cleanup and exit with the matching WIFSIGNALED status.
+    let byte = signum as u8;
     unsafe {
         libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
     }
@@ -655,15 +663,24 @@ fn start_signal_thread(state: SharedState) {
         loop {
             let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
             if n >= 0 {
-                break; // got the byte (1) or EOF (0)
+                break; // got the signum byte, or EOF (0)
             }
             if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
                 break;
             }
         }
+        let signum = buf[0] as libc::c_int;
         eprintln!("Received termination signal; stopping any running job and exiting");
         kill_running(&state);
-        std::process::exit(0);
+        // Re-raise the original signal under the default disposition so we
+        // terminate *from* that signal: the parent's waitpid then reports
+        // WIFSIGNALED(signum) instead of a misleading exit(0). The _exit is a
+        // fallback in case the signal is somehow blocked and raise() returns.
+        unsafe {
+            libc::signal(signum, libc::SIG_DFL);
+            libc::raise(signum);
+            libc::_exit(128 + signum);
+        }
     });
 }
 

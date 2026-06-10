@@ -573,15 +573,27 @@ fn sigterm_terminates_child_job_no_orphan() {
     assert!(send_signal(server_pid, "-TERM"), "failed to SIGTERM server");
 
     let exit_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let server_status = loop {
         match s.child.try_wait() {
-            Ok(Some(_)) | Err(_) => break,
+            Ok(Some(st)) => break Some(st),
+            Err(_) => break None,
             Ok(None) => {}
         }
         if Instant::now() > exit_deadline {
             panic!("server did not exit after SIGTERM");
         }
         thread::sleep(Duration::from_millis(50));
+    };
+
+    // The server must terminate *via* SIGTERM (re-raised after cleanup), not a
+    // masking exit(0). 15 == SIGTERM.
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(st) = server_status {
+        assert_eq!(
+            st.signal(),
+            Some(15),
+            "server should exit via SIGTERM, got {st:?}"
+        );
     }
 
     // The job must be gone — not left orphaned and running.
