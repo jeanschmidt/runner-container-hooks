@@ -90,6 +90,23 @@ impl State {
 
 type SharedState = Arc<Mutex<State>>;
 
+// Lock the state, recovering from poisoning instead of propagating the panic.
+// Thread-per-request means a panic in one handler while it holds the lock would
+// otherwise poison the Mutex and make every later `.lock_state()` panic too,
+// turning the server into a process that fails every request forever. Our State
+// is a few plain fields with no cross-field invariant that a mid-update panic
+// could leave half-applied, so taking the (possibly stale) inner value and
+// carrying on degrades far more gracefully than wedging the whole server.
+trait LockRecover<T> {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for Mutex<T> {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 // --- JSON: hand-rolled. Payloads are 2-3 string/int fields, no nesting. ---
 
 fn json_escape(s: &str, out: &mut String) {
@@ -303,7 +320,7 @@ fn wait_for_process(state: SharedState, job_id: String, mut child: Child) {
         .wait()
         .map(|st| st.code().or_else(|| st.signal().map(|s| -s)).unwrap_or(-1))
         .unwrap_or(-1);
-    let mut s = state.lock().unwrap();
+    let mut s = state.lock_state();
     if s.job_id.as_deref() == Some(&job_id) {
         s.exit_code = Some(code);
         s.status = if code == 0 {
@@ -324,7 +341,7 @@ fn wait_for_process(state: SharedState, job_id: String, mut child: Child) {
 // replaced by a different /exec? Once true, there's nothing left for a killer
 // targeting `expected` to do.
 fn job_slot_settled(state: &SharedState, expected: &str) -> bool {
-    let s = state.lock().unwrap();
+    let s = state.lock_state();
     s.job_id.as_deref() != Some(expected) || s.exit_code.is_some()
 }
 
@@ -337,7 +354,7 @@ fn job_slot_settled(state: &SharedState, expected: &str) -> bool {
 // observe the state transition.
 fn kill_running_if_match(state: &SharedState, expected: &str) {
     let pid = {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock_state();
         let matches_target = matches!(
             (s.child_pid, s.job_id.as_deref()),
             (Some(_), Some(jid)) if jid == expected
@@ -392,7 +409,7 @@ fn kill_running_if_match(state: &SharedState, expected: &str) {
 // than escalate SIGKILL against a stale process group.
 fn kill_running(state: &SharedState) {
     let expected = {
-        let s = state.lock().unwrap();
+        let s = state.lock_state();
         match (&s.job_id, s.exit_code) {
             (Some(jid), None) => jid.clone(),
             _ => return,
@@ -408,14 +425,14 @@ fn handle_health(req: Request) {
 }
 
 fn handle_status(req: Request, state: &SharedState) {
-    let s = state.lock().unwrap();
+    let s = state.lock_state();
     let body = status_json(&s);
     drop(s);
     let _ = req.respond(json_response(body, 200));
 }
 
 fn handle_heartbeat(req: Request, state: &SharedState) {
-    state.lock().unwrap().last_heartbeat = Some(Instant::now());
+    state.lock_state().last_heartbeat = Some(Instant::now());
     let _ = req.respond(json_response(r#"{"status":"ok"}"#.into(), 200));
 }
 
@@ -439,7 +456,7 @@ fn handle_exec(mut req: Request, state: &SharedState) {
 
     // Step 1: under lock, reserve the slot with a "starting" sentinel.
     let prev_status = {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock_state();
         if matches!(
             s.status,
             JobStatus::Running | JobStatus::Starting | JobStatus::Killing
@@ -459,7 +476,7 @@ fn handle_exec(mut req: Request, state: &SharedState) {
     let child = match spawn_job(job_id, path) {
         Ok(c) => c,
         Err(e) => {
-            state.lock().unwrap().status = prev_status;
+            state.lock_state().status = prev_status;
             let mut body = String::from(r#"{"error":"#);
             json_escape(&e.to_string(), &mut body);
             body.push('}');
@@ -472,7 +489,7 @@ fn handle_exec(mut req: Request, state: &SharedState) {
 
     // Step 3: commit running state under lock.
     {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock_state();
         s.job_id = Some(job_id.clone());
         s.status = JobStatus::Running;
         s.exit_code = None;
@@ -492,7 +509,7 @@ fn handle_exec(mut req: Request, state: &SharedState) {
 
 fn handle_kill(req: Request, state: &SharedState) {
     kill_running(state);
-    let body = status_json(&state.lock().unwrap());
+    let body = status_json(&state.lock_state());
     let _ = req.respond(json_response(body, 200));
 }
 
@@ -506,7 +523,7 @@ fn handle_logs(req: Request, state: &SharedState) {
         _ => "stdout",
     };
 
-    let job_id = state.lock().unwrap().job_id.clone();
+    let job_id = state.lock_state().job_id.clone();
     let Some(job_id) = job_id else {
         respond_bytes(req, Vec::new(), false);
         return;
@@ -555,7 +572,7 @@ fn dispatch(req: Request, state: SharedState) {
         return handle_health(req);
     }
 
-    let token = { state.lock().unwrap().auth_token.clone() };
+    let token = { state.lock_state().auth_token.clone() };
     // /exec, /kill, /heartbeat all require auth; /status and /logs too.
     if !check_auth(&req, &token) {
         let _ = req.respond(empty(403));
@@ -587,7 +604,7 @@ fn start_heartbeat_watchdog(state: SharedState) {
         // can't have its fresh heartbeat clobbered, and can't be killed in
         // place of the job that actually timed out.
         let target_job_id = {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock_state();
             let timed_out = matches!(s.last_heartbeat, Some(t) if t.elapsed() > timeout);
             if !timed_out {
                 continue;
@@ -846,5 +863,27 @@ fn main() {
     for req in server.incoming_requests() {
         let s = Arc::clone(&state);
         thread::spawn(move || dispatch(req, s));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_state_recovers_from_poison() {
+        let m = Arc::new(Mutex::new(5));
+        let m2 = Arc::clone(&m);
+        // Panic while holding the lock -> the Mutex is now poisoned.
+        let _ = thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+        // A plain lock().unwrap() would now panic forever...
+        assert!(m.lock().is_err(), "mutex should be poisoned");
+        // ...but lock_state() recovers and yields the inner value, so the
+        // server keeps serving instead of failing every subsequent request.
+        assert_eq!(*m.lock_state(), 5);
     }
 }
