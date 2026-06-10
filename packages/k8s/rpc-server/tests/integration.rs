@@ -520,6 +520,83 @@ fn kill_reports_killing_during_teardown() {
     assert!(kb.contains(r#""exit_code":-9"#), "got: {kb}");
 }
 
+// --- Graceful shutdown: signal forwarded to the child, no orphan ---
+
+// Send a signal to `pid` via /bin/kill (avoids a libc dev-dependency). `sig` is
+// e.g. "-TERM" or "-0"; returns true if kill reported success (for "-0", that
+// means the process exists).
+fn send_signal(pid: i32, sig: &str) -> bool {
+    std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        // Silence "No such process" noise from the liveness ("-0") polls.
+        .stderr(Stdio::null())
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn sigterm_terminates_child_job_no_orphan() {
+    let mut s = Server::start();
+    let pidfile = s.tmpdir.join("child.pid");
+    // The job records its own PID (== its process-group leader, thanks to the
+    // server's setsid) then sleeps. We use that PID to check it's really gone.
+    let script = s.write_script(
+        "pidwrite.sh",
+        &format!("#!/bin/sh\necho $$ > '{}'\nsleep 30\n", pidfile.display()),
+    );
+    let body = format!(r#"{{"id":"orphan","path":"{script}"}}"#);
+    let (c, _) = s.raw("POST", "/exec", Some(TOKEN), Some(&body));
+    assert_eq!(c, 200);
+
+    // Wait for the job to publish its PID.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let child_pid: i32 = loop {
+        if let Ok(txt) = std::fs::read_to_string(&pidfile) {
+            if let Ok(pid) = txt.trim().parse::<i32>() {
+                break pid;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!("job never wrote its pid");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        send_signal(child_pid, "-0"),
+        "job should be alive before SIGTERM"
+    );
+
+    // SIGTERM the server; its handler must forward termination to the job's
+    // process group and then exit on its own.
+    let server_pid = s.child.id() as i32;
+    assert!(send_signal(server_pid, "-TERM"), "failed to SIGTERM server");
+
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match s.child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {}
+        }
+        if Instant::now() > exit_deadline {
+            panic!("server did not exit after SIGTERM");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // The job must be gone — not left orphaned and running.
+    let alive_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if !send_signal(child_pid, "-0") {
+            break;
+        }
+        if Instant::now() > alive_deadline {
+            panic!("child job {child_pid} still alive after server SIGTERM (orphaned)");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // --- Heartbeat watchdog ---
 
 #[test]

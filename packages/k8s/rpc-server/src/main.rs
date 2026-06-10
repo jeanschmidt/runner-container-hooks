@@ -10,6 +10,7 @@ use std::os::unix::io::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -600,17 +601,70 @@ fn start_heartbeat_watchdog(state: SharedState) {
     });
 }
 
-// Signal handler must be async-signal-safe, so it does the minimum: just
-// _exit(0). It does NOT kill the running child/job — the child lives in its
-// own session (see pre_exec setsid), so killpg wouldn't reach it anyway, and
-// tracking the pid to kill it here would mean touching a mutex from signal
-// context, which isn't async-signal-safe. On SIGTERM/SIGINT the pod is being
-// torn down, so the kernel reaps this process and pod teardown GCs whatever
-// job process remains. We forgo a clean listener shutdown for the same reason.
+// Write end of the self-pipe the signal handler nudges; -1 until main wires it
+// up. A RawFd is just an i32, so an atomic load/store of it is lock-free and
+// async-signal-safe.
+static SIGNAL_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+// Set on the first termination signal so a second one force-exits instead of
+// waiting for graceful child teardown.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+// Self-pipe handler. It does ONLY async-signal-safe work — lock-free atomics
+// plus write()/_exit(), all on the POSIX async-signal-safe list — and hands the
+// real teardown to start_signal_thread(), which runs in normal context where it
+// can take the state mutex and signal the child. Doing that work here instead
+// would mean locking a mutex from signal context, which can deadlock if the
+// signal interrupts a thread already holding it.
 extern "C" fn signal_handler(_signum: libc::c_int) {
-    unsafe {
-        libc::_exit(0);
+    if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+        // Second signal: the operator/orchestrator is impatient — exit now
+        // rather than waiting out the graceful child-kill grace period.
+        unsafe { libc::_exit(0) };
     }
+    let fd = SIGNAL_PIPE_WRITE.load(Ordering::Relaxed);
+    if fd < 0 {
+        // No self-pipe (setup failed) — can't do graceful teardown, but we must
+        // still honor the signal rather than ignore it.
+        unsafe { libc::_exit(0) };
+    }
+    let byte = 1u8;
+    unsafe {
+        libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
+    }
+}
+
+// Spawn the thread that turns a termination signal into a graceful shutdown.
+// The user's job runs in its own session (pre_exec setsid), so it does NOT
+// receive the SIGTERM/SIGINT delivered to this server — without forwarding it
+// would be orphaned and keep running when the server is stopped locally or in
+// tests. On signal we SIGTERM the job's process group, escalate to SIGKILL
+// after the grace period (kill_running), then exit.
+fn start_signal_thread(state: SharedState) {
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        // Leave SIGNAL_PIPE_WRITE == -1; the handler will _exit(0) on signal,
+        // matching the previous best-effort behavior.
+        return;
+    }
+    let read_fd = fds[0];
+    SIGNAL_PIPE_WRITE.store(fds[1], Ordering::Relaxed);
+
+    thread::spawn(move || {
+        // Block until the handler nudges us (retrying on EINTR).
+        let mut buf = [0u8; 1];
+        loop {
+            let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+            if n >= 0 {
+                break; // got the byte (1) or EOF (0)
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
+        eprintln!("Received termination signal; stopping any running job and exiting");
+        kill_running(&state);
+        std::process::exit(0);
+    });
 }
 
 fn install_signal_handlers() {
@@ -755,9 +809,12 @@ fn main() {
 
     write_oom_score_adj_self("-1000");
     let _ = fs::create_dir_all(LOG_DIR);
-    install_signal_handlers();
 
     let state = Arc::new(Mutex::new(State::new(token)));
+    // Wire up the self-pipe before installing handlers so the very first signal
+    // has a thread to hand off to (rather than racing an unset pipe fd).
+    start_signal_thread(Arc::clone(&state));
+    install_signal_handlers();
     start_heartbeat_watchdog(Arc::clone(&state));
 
     let server = Server::from_listener(listener, None).expect("server");
