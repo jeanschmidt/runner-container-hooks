@@ -694,6 +694,50 @@ fn watchdog_kill_then_new_job_supervised() {
     );
 }
 
+#[test]
+fn no_watchdog_log_after_clean_completion() {
+    // After a job finishes, the client stops heartbeating. The watchdog must
+    // not later fire on the stale last_heartbeat and log a misleading
+    // "heartbeat timeout, killing job" for a job that already completed.
+    let mut s = Server::start_with_env(&[
+        ("RPC_HEARTBEAT_TIMEOUT_SECS", "2"),
+        ("RPC_WATCHDOG_TICK_SECS", "1"),
+    ]);
+
+    // Drain the server's stderr in the background so we can inspect it.
+    let stderr = s.child.stderr.take().expect("stderr");
+    let log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let log_writer = std::sync::Arc::clone(&log);
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => log_writer.lock().unwrap().push_str(&line),
+            }
+        }
+    });
+
+    let script = s.write_script("quick.sh", "#!/bin/sh\nexit 0\n");
+    let body = format!(r#"{{"id":"quick","path":"{script}"}}"#);
+    let (c, _) = s.raw("POST", "/exec", Some(TOKEN), Some(&body));
+    assert_eq!(c, 200);
+    let st = s.wait_terminal(Duration::from_secs(5));
+    assert!(st.contains(r#""status":"completed""#), "got: {st}");
+
+    // Wait well past the heartbeat timeout + several watchdog ticks; with the
+    // bug the watchdog would have logged by now.
+    thread::sleep(Duration::from_secs(5));
+
+    let captured = log.lock().unwrap().clone();
+    assert!(
+        !captured.contains("Heartbeat timeout"),
+        "watchdog fired for an already-completed job; stderr:\n{captured}"
+    );
+}
+
 // --- /logs paging at MAX_CHUNK ---
 
 #[test]

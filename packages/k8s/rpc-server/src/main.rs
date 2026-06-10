@@ -312,6 +312,11 @@ fn wait_for_process(state: SharedState, job_id: String, mut child: Child) {
             JobStatus::Failed
         };
         s.child_pid = None;
+        // Disarm the watchdog: the job is done, and the client stops sending
+        // heartbeats once it observes a terminal status. Without this the
+        // watchdog would, one timeout later, log a misleading "heartbeat
+        // timeout, killing job" for a job that already finished cleanly.
+        s.last_heartbeat = None;
     }
 }
 
