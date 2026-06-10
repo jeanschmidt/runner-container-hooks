@@ -91,6 +91,19 @@ export async function deployRpcServer(
     )
   }
 
+  // rpc-server-script.ts ships with empty placeholders that CI overwrites with
+  // the real base64 during the build (prebuild -> build-rpc-server.sh +
+  // embed-rpc-server.js). If the package is consumed without that step, the
+  // blob is "" and we'd otherwise deploy a 0-byte /tmp/rpc-server that fails to
+  // exec — surfacing much later as a baffling "could not parse listening port"
+  // / health-check timeout. Fail fast with an actionable message instead.
+  if (!binaryB64) {
+    throw new Error(
+      `RPC: no embedded ${arch} server binary — run packages/k8s/scripts/build-rpc-server.sh ` +
+        `then scripts/embed-rpc-server.js (CI does this via the k8s package prebuild)`
+    )
+  }
+
   // Stream the base64 blob over the exec's stdin and decode it in-pod, rather
   // than inlining it as a shell argument. The blob is ~830 KB; passing it as
   // argv (`echo '<base64>'`) blows past Linux's MAX_ARG_STRLEN (128 KiB per
