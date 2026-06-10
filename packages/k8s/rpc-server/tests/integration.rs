@@ -92,56 +92,7 @@ impl Server {
         token: Option<&str>,
         body: Option<&str>,
     ) -> (u16, HashMap<String, String>, String) {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
-        use std::io::Write;
-        let body = body.unwrap_or("");
-        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
-        if let Some(t) = token {
-            req.push_str(&format!("X-Auth-Token: {t}\r\n"));
-        }
-        if !body.is_empty() {
-            req.push_str("Content-Type: application/json\r\n");
-            req.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        }
-        req.push_str("Connection: close\r\n\r\n");
-        req.push_str(body);
-        stream.write_all(req.as_bytes()).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        // Read raw bytes: log responses are octet-streams that may not be UTF-8
-        // and can be large (MAX_CHUNK), so don't assume String.
-        let mut resp = Vec::new();
-        use std::io::Read;
-        let _ = stream.read_to_end(&mut resp);
-        let split = resp
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|i| i + 4)
-            .unwrap_or(resp.len());
-        let head = String::from_utf8_lossy(&resp[..split]).to_string();
-        let body_bytes = resp.get(split..).unwrap_or(&[]).to_vec();
-        let status: u16 = head
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let mut headers = HashMap::new();
-        for line in head.lines().skip(1) {
-            if let Some((k, v)) = line.split_once(':') {
-                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-            }
-        }
-        // tiny_http streams large bodies with Transfer-Encoding: chunked; undo
-        // the chunk framing so callers see the real payload bytes.
-        let body_bytes = if headers.get("transfer-encoding").map(String::as_str) == Some("chunked")
-        {
-            dechunk(&body_bytes)
-        } else {
-            body_bytes
-        };
-        let body = String::from_utf8_lossy(&body_bytes).to_string();
-        (status, headers, body)
+        http_roundtrip(self.port, method, path, token, body)
     }
 
     fn write_script(&self, name: &str, body: &str) -> String {
@@ -167,6 +118,67 @@ impl Server {
             thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+// Issue one HTTP/1.1 request to 127.0.0.1:port and return (status, headers, body).
+// Free function (not a method) so tests can drive a server from a separate
+// thread without sharing the Server handle.
+fn http_roundtrip(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+) -> (u16, HashMap<String, String>, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    use std::io::Write;
+    let body = body.unwrap_or("");
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+    if let Some(t) = token {
+        req.push_str(&format!("X-Auth-Token: {t}\r\n"));
+    }
+    if !body.is_empty() {
+        req.push_str("Content-Type: application/json\r\n");
+        req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    req.push_str(body);
+    stream.write_all(req.as_bytes()).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // Read raw bytes: log responses are octet-streams that may not be UTF-8
+    // and can be large (MAX_CHUNK), so don't assume String.
+    let mut resp = Vec::new();
+    use std::io::Read;
+    let _ = stream.read_to_end(&mut resp);
+    let split = resp
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(resp.len());
+    let head = String::from_utf8_lossy(&resp[..split]).to_string();
+    let body_bytes = resp.get(split..).unwrap_or(&[]).to_vec();
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut headers = HashMap::new();
+    for line in head.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+    // tiny_http streams large bodies with Transfer-Encoding: chunked; undo
+    // the chunk framing so callers see the real payload bytes.
+    let body_bytes = if headers.get("transfer-encoding").map(String::as_str) == Some("chunked") {
+        dechunk(&body_bytes)
+    } else {
+        body_bytes
+    };
+    let body = String::from_utf8_lossy(&body_bytes).to_string();
+    (status, headers, body)
 }
 
 // Decode an HTTP/1.1 chunked transfer-encoding body into its raw bytes.
@@ -466,6 +478,45 @@ fn kill_escalates_to_sigkill_when_sigterm_ignored() {
     );
     assert!(kb.contains(r#""status":"failed""#), "got: {kb}");
     // SIGKILL is signal 9 -> exit_code -9.
+    assert!(kb.contains(r#""exit_code":-9"#), "got: {kb}");
+}
+
+#[test]
+fn kill_reports_killing_during_teardown() {
+    // A job that ignores SIGTERM keeps the killer in its grace window. While the
+    // kill is in flight, /status must report "killing" (not "running"), so a
+    // poller can tell teardown was initiated. 4s grace gives a comfortable
+    // window to observe it.
+    let s = Server::start_with_env(&[("RPC_KILL_GRACE_SECS", "4")]);
+    let script = s.write_script(
+        "ignore-term2.sh",
+        "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 0.2; done\n",
+    );
+    let body = format!(r#"{{"id":"teardown","path":"{script}"}}"#);
+    let (c, _) = s.raw("POST", "/exec", Some(TOKEN), Some(&body));
+    assert_eq!(c, 200);
+    thread::sleep(Duration::from_millis(200));
+
+    // Kill on a separate thread — it blocks through the grace window.
+    let port = s.port;
+    let killer = thread::spawn(move || http_roundtrip(port, "POST", "/kill", Some(TOKEN), None));
+
+    // Mid-teardown, status should read "killing".
+    thread::sleep(Duration::from_millis(800));
+    let (_, st) = s.raw("GET", "/status", Some(TOKEN), None);
+    assert!(
+        st.contains(r#""status":"killing""#),
+        "expected killing during teardown, got: {st}"
+    );
+
+    // A new /exec is refused while killing.
+    let (busy, _) = s.raw("POST", "/exec", Some(TOKEN), Some(&body));
+    assert_eq!(busy, 409);
+
+    // Once the killer finishes, the job is failed (SIGKILL -> -9).
+    let (kc, _, kb) = killer.join().expect("killer thread");
+    assert_eq!(kc, 200);
+    assert!(kb.contains(r#""status":"failed""#), "got: {kb}");
     assert!(kb.contains(r#""exit_code":-9"#), "got: {kb}");
 }
 

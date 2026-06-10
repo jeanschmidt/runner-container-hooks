@@ -10,7 +10,9 @@ interface RpcStatusResponse {
   // Python server sets _job_id = None at startup and only assigns a value
   // when /exec accepts a job.
   id: string | null
-  status: 'idle' | 'running' | 'completed' | 'failed'
+  // 'starting'/'killing' are transient server-side states (job being launched
+  // or torn down); the poll loop treats them like 'running' and keeps waiting.
+  status: 'idle' | 'starting' | 'running' | 'killing' | 'completed' | 'failed'
   exit_code: number | null
 }
 

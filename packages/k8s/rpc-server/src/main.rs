@@ -38,6 +38,13 @@ enum JobStatus {
     Idle,
     Starting,
     Running,
+    // Termination has been initiated (SIGTERM sent, possibly escalating to
+    // SIGKILL) but the process hasn't been reaped yet. Distinct from Running so
+    // a /status or /kill poll during teardown — including the pathological case
+    // where the target is wedged in uninterruptible sleep and outlives the
+    // SIGKILL grace window — reports "killing" rather than a misleading
+    // "running" that looks like the kill never happened.
+    Killing,
     Completed,
     Failed,
 }
@@ -48,6 +55,7 @@ impl JobStatus {
             Self::Idle => "idle",
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::Killing => "killing",
             Self::Completed => "completed",
             Self::Failed => "failed",
         }
@@ -323,11 +331,18 @@ fn job_slot_settled(state: &SharedState, expected: &str) -> bool {
 // observe the state transition.
 fn kill_running_if_match(state: &SharedState, expected: &str) {
     let pid = {
-        let s = state.lock().unwrap();
-        match (s.child_pid, s.job_id.as_deref()) {
-            (Some(pid), Some(jid)) if jid == expected && s.exit_code.is_none() => pid,
-            _ => return,
+        let mut s = state.lock().unwrap();
+        let matches_target = matches!(
+            (s.child_pid, s.job_id.as_deref()),
+            (Some(_), Some(jid)) if jid == expected
+        ) && s.exit_code.is_none();
+        if !matches_target {
+            return;
         }
+        // Mark teardown in progress so concurrent /status and /kill polls see
+        // "killing" instead of "running" while we signal and wait for the reap.
+        s.status = JobStatus::Killing;
+        s.child_pid.unwrap()
     };
 
     let grace = env_duration_secs("RPC_KILL_GRACE_SECS", KILL_GRACE_DEFAULT_SECS);
@@ -346,8 +361,11 @@ fn kill_running_if_match(state: &SharedState, expected: &str) {
             }
             if Instant::now() >= deadline {
                 libc::killpg(pgid, libc::SIGKILL);
-                // After SIGKILL the waiter will reap; give it a brief moment
-                // so /kill's status snapshot reflects the death.
+                // After SIGKILL the waiter normally reaps within milliseconds;
+                // wait briefly so /kill's status snapshot reflects the death. If
+                // the target is stuck in uninterruptible sleep and outlives even
+                // this, we return with status still "killing" (set above) — an
+                // accurate "teardown in progress", not a misleading "running".
                 let kill_deadline = Instant::now() + Duration::from_secs(2);
                 while Instant::now() < kill_deadline {
                     if job_slot_settled(state, expected) {
@@ -416,7 +434,10 @@ fn handle_exec(mut req: Request, state: &SharedState) {
     // Step 1: under lock, reserve the slot with a "starting" sentinel.
     let prev_status = {
         let mut s = state.lock().unwrap();
-        if matches!(s.status, JobStatus::Running | JobStatus::Starting) {
+        if matches!(
+            s.status,
+            JobStatus::Running | JobStatus::Starting | JobStatus::Killing
+        ) {
             let _ = req.respond(json_response(
                 r#"{"error":"A job is already running"}"#.into(),
                 409,
