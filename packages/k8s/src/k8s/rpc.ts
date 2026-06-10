@@ -156,7 +156,10 @@ export async function deployRpcServer(
         podName,
         containerName
       )
-      const match = stdout.match(/\[::\]:(\d+)/)
+      // Match the full announcement line (multiline-anchored) rather than a
+      // bare "[::]:NNNN" substring, so unrelated stdout noise can't be
+      // mistaken for the port line.
+      const match = stdout.match(/^RPC server listening on \[::\]:(\d+)$/m)
       const parsed = match ? parseInt(match[1], 10) : NaN
       if (exitCode !== 0 || isNaN(parsed) || parsed <= 0) {
         throw new Error(
