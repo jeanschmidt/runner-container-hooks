@@ -1429,8 +1429,21 @@ async function describePodUnhealth(podName: string): Promise<string> {
           return `${cs.name}: ${bits.join(' ')}`
         }
         if (waiting) {
-          const bits = [waiting.reason, waiting.message].filter(Boolean)
-          return `${cs.name}: ${bits.join(' ')}`
+          const bits = [waiting.reason, waiting.message]
+          // For CrashLoopBackOff the current state is `waiting`, but the
+          // reason the container crashed lives in the previous termination.
+          const lastTerminated = cs.lastState?.terminated
+          if (lastTerminated) {
+            bits.push(
+              `lastState=${[
+                lastTerminated.reason,
+                `exitCode=${lastTerminated.exitCode}`
+              ]
+                .filter(Boolean)
+                .join(' ')}`
+            )
+          }
+          return `${cs.name}: ${bits.filter(Boolean).join(' ')}`
         }
         return undefined
       })
