@@ -1452,7 +1452,9 @@ async function describePodUnhealth(podName: string): Promise<string> {
     if (containerDetail) {
       parts.push(`containers=[${containerDetail}]`)
     }
-    return parts.length ? parts.join(', ') : '(no additional pod status details)'
+    return parts.length
+      ? parts.join(', ')
+      : '(no additional pod status details)'
   } catch (err) {
     return `(failed to read pod status: ${
       err instanceof Error ? err.message : String(err)
