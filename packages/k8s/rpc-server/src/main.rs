@@ -846,6 +846,18 @@ fn main() {
         }
     }
 
+    // Log every panic to stderr (redirected to /tmp/rpc-server.log in daemon
+    // mode) before the default hook runs, so a request-thread panic leaves a
+    // clear, greppable breadcrumb instead of the server silently vanishing.
+    // With panic="unwind" only the offending thread unwinds; the server keeps
+    // serving (and the diagnostic can read this marker).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("FATAL rpc-server panic: {info}");
+        let _ = std::io::stderr().flush();
+        default_hook(info);
+    }));
+
     write_oom_score_adj_self("-1000");
     let _ = fs::create_dir_all(LOG_DIR);
 

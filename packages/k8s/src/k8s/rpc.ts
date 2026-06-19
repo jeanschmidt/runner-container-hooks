@@ -4,6 +4,12 @@ import { Readable } from 'stream'
 import { sleep } from './utils'
 import { execPodStep, execPodStepOutput, getPodByName } from './index'
 import { RPC_SERVER_AMD64, RPC_SERVER_ARM64 } from './rpc-server-script'
+import {
+  CONTAINER_DEATH_PROBE,
+  PodFailureDiagnostic,
+  classifyContainerDeath,
+  parseContainerDeathProbe
+} from './rpc-diagnostics'
 
 interface RpcStatusResponse {
   // null when no job has run yet (server is in initial 'idle' state). The
@@ -230,17 +236,6 @@ export async function deployRpcServer(
   )
 }
 
-interface PodFailureDiagnostic {
-  cause:
-    | 'container-oom'
-    | 'pod-evicted'
-    | 'node-failure'
-    | 'rpc-process-died'
-    | 'unknown'
-  exitCode: number
-  message: string
-}
-
 async function diagnosePodFailure(
   podName: string,
   containerName: string
@@ -298,18 +293,17 @@ async function diagnosePodFailure(
     }
   }
 
-  // Container still running — RPC server process likely crashed inside it
+  // Container (PID 1 keep-alive) is still up but the RPC server — a child
+  // process, not PID 1 — stopped answering. Probe the cgroup to tell an OOM
+  // apart from a server-side crash rather than guessing. The container being
+  // Running is exactly what keeps /sys/fs/cgroup readable here.
   if (phase === 'Running' && containerStatus?.state?.running) {
-    let serverLog = ''
+    let probe = ''
     try {
       let execTimer: ReturnType<typeof setTimeout>
       const result = await Promise.race([
         execPodStepOutput(
-          [
-            'sh',
-            '-c',
-            'tail -20 /tmp/rpc-server.log 2>/dev/null || echo "(no server log)"'
-          ],
+          ['sh', '-c', CONTAINER_DEATH_PROBE],
           podName,
           containerName
         ),
@@ -320,15 +314,23 @@ async function diagnosePodFailure(
           )
         })
       ]).finally(() => clearTimeout(execTimer))
-      serverLog = result.stdout
+      probe = result.stdout
     } catch {
-      // Diagnostic exec failed — proceed without server log
+      // Probe exec failed (kubelet/node unreachable, etc.) — no evidence.
     }
-    return {
-      cause: 'rpc-process-died',
-      exitCode: -1,
-      message: `RPC server process died while container is still running (likely process-level OOM or crash)${serverLog ? `\nServer log:\n${serverLog}` : ''}`
+
+    if (!probe) {
+      return {
+        cause: 'rpc-process-died',
+        exitCode: -1,
+        message:
+          'RPC server process died while container is still running, and the ' +
+          'cgroup diagnostic probe could not be run (kubelet/node unreachable?). ' +
+          'Cause unknown — could be a process-level OOM or a crash.'
+      }
     }
+
+    return classifyContainerDeath(parseContainerDeathProbe(probe))
   }
 
   return {
