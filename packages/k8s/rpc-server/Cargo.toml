@@ -12,7 +12,13 @@ libc = "0.2"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# Unwind (not abort) so a panic in one request thread only unwinds that thread —
+# the server keeps serving and the LockRecover/lock_state() poison recovery
+# actually runs. Under panic="abort" any handler panic SIGABRTs the whole
+# process (taking down an in-flight job), and the poison-recovery path is dead
+# code because aborting never poisons a mutex. Costs a little binary size for
+# unwind tables; correctness/resilience wins.
+panic = "unwind"
 strip = true
 
 [[bin]]
