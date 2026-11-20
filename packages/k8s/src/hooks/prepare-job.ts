@@ -27,7 +27,8 @@ import {
   readExtensionFromFile,
   PodPhase,
   fixArgs,
-  prepareJobScript
+  prepareJobScript,
+  resolveUserVolumeSourcePath
 } from '../k8s/utils'
 import {
   CONTAINER_EXTENSION_PREFIX,
@@ -46,6 +47,12 @@ export async function prepareJob(
   if (!args.container) {
     throw new Error('Job Container is required.')
   }
+
+  // Check the volume sources before creating anything.
+  const userMountVolumes = (args.container.userMountVolumes || []).map(v => ({
+    ...v,
+    sourceVolumePath: resolveUserVolumeSourcePath(v.sourceVolumePath)
+  }))
 
   core.info(`[prepare_job] workflow image: ${args.container.image}`)
   for (const service of args.services || []) {
@@ -148,7 +155,7 @@ export async function prepareJob(
     }
 
     const promises: Promise<void>[] = []
-    for (const vol of args?.container?.userMountVolumes || []) {
+    for (const vol of userMountVolumes) {
       promises.push(
         execCpToPod(
           createdPod.metadata.name,
